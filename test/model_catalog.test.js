@@ -38,7 +38,7 @@ test('ModelCatalogManager prunes models safely and keeps required fields', () =>
   assert.equal(pruned.length, 2);
 
   const m1 = pruned[0];
-  assert.equal(m1.id, 'zai/glm-5.3-flash');
+  assert.equal(m1.id, 'glm-5.3-flash');
   assert.equal(m1.name, 'GLM 5.3 Flash');
   assert.equal(m1.provider, 'zai');
   assert.equal(m1.contextWindow, 1048576);
@@ -47,6 +47,30 @@ test('ModelCatalogManager prunes models safely and keeps required fields', () =>
   assert.equal(m1.thinking, true);
   assert.equal(m1.cost, undefined); // pruned
   assert.equal(m1.pricingStatus, undefined); // pruned
+});
+
+test('ModelCatalogManager strips redundant provider prefix from model id', () => {
+  const manager = new ModelCatalogManager();
+  const rawModels = [
+    {
+      provider: 'openrouter',
+      id: 'openrouter/deepseek/deepseek-v4.1-flash',
+      selector: 'openrouter/deepseek/deepseek-v4.1-flash',
+      name: 'DeepSeek V4.1 Flash'
+    },
+    {
+      provider: 'openrouter',
+      id: 'deepseek/deepseek-v4.1-flash',
+      selector: 'openrouter/deepseek/deepseek-v4.1-flash',
+      name: 'DeepSeek V4.1 Flash'
+    }
+  ];
+
+  const pruned = manager.pruneModels(rawModels);
+  assert.equal(pruned[0].id, 'deepseek/deepseek-v4.1-flash');
+  assert.equal(pruned[0].provider, 'openrouter');
+  assert.equal(pruned[1].id, 'deepseek/deepseek-v4.1-flash');
+  assert.equal(pruned[1].provider, 'openrouter');
 });
 
 test('ModelCatalogManager creates valid response payload under frame limit', () => {
@@ -80,7 +104,7 @@ test('ModelCatalogManager creates valid response payload under frame limit', () 
 test('ModelCatalogManager intercepts get_available_models frame', () => {
   const manager = new ModelCatalogManager();
   manager.setCachedModels([
-    { id: 'zai/glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'zai' }
+    { id: 'glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'zai' }
   ]);
 
   const reqLine = '{"type": "get_available_models", "id": "test-req"}';

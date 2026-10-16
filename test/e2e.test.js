@@ -101,3 +101,38 @@ test('E2E: Aborted turn triggers agent_settled with aborted: true', async () => 
 
   pipeline.stop();
 });
+
+test('E2E: Upstream set_model normalizes redundant provider prefix before forwarding to child', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+
+  const pipeline = createProxyPipeline({
+    clientIn,
+    clientOut,
+    childIn,
+    childOut
+  });
+
+  const childLines = collectLines(childIn);
+  pipeline.start();
+
+  // T3 sends double-prefixed set_model from old thread state
+  clientIn.write('{"type": "set_model", "provider": "openrouter", "modelId": "openrouter/deepseek/deepseek-v4.1-flash"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(childLines.lines.length, 1);
+  const forwarded = JSON.parse(childLines.lines[0]);
+  assert.equal(forwarded.type, 'set_model');
+  assert.equal(forwarded.provider, 'openrouter');
+  assert.equal(forwarded.modelId, 'deepseek/deepseek-v4.1-flash');
+
+  // When modelId is already clean, it passes through untouched
+  clientIn.write('{"type": "set_model", "provider": "openrouter", "modelId": "deepseek/deepseek-v4.1-flash"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(childLines.lines.length, 2);
+  const forwarded2 = JSON.parse(childLines.lines[1]);
+  assert.equal(forwarded2.modelId, 'deepseek/deepseek-v4.1-flash');
+
+  pipeline.stop();
+});

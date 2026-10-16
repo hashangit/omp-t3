@@ -76,7 +76,28 @@ function createProxyPipeline(options) {
         return;
       }
 
-      // 4. Byte-preserving transparent passthrough
+      // 4. Normalize set_model if redundant provider prefix is present (e.g. from existing thread state)
+      if (trimmed.includes('"type":"set_model"') || trimmed.includes('"type": "set_model"')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && parsed.type === 'set_model' && parsed.provider && typeof parsed.modelId === 'string') {
+            let cleanId = parsed.modelId;
+            const prefix = `${parsed.provider}/`;
+            while (cleanId.startsWith(prefix) && cleanId.length > prefix.length) {
+              cleanId = cleanId.slice(prefix.length);
+            }
+            if (cleanId !== parsed.modelId) {
+              parsed.modelId = cleanId;
+              childIn.write(JSON.stringify(parsed) + '\n');
+              return;
+            }
+          }
+        } catch {
+          // Fall through to default passthrough
+        }
+      }
+
+      // 5. Byte-preserving transparent passthrough
       childIn.write(line + '\n');
     });
 

@@ -17,6 +17,8 @@ class ModelCatalogManager {
   /**
    * Prunes raw OMP model list into safe, compliant ModelInfo objects.
    * Strips large schemas, pricing, and input arrays.
+   * Strips redundant provider prefix from model id so T3 Code's slug builder
+   * (`${provider}/${id}`) does not produce duplicate prefixes (e.g. openrouter/openrouter/...).
    * @param {any[] | { models: any[] }} rawInput 
    * @returns {any[]}
    */
@@ -31,10 +33,17 @@ class ModelCatalogManager {
     }
 
     return list.map((item) => {
-      // T3 expects selector or provider/id as identifier
-      const id = item.selector || (item.provider ? `${item.provider}/${item.id}` : item.id);
-      const name = item.name || item.id;
       const provider = item.provider || 'omp';
+      let id = item.id || item.selector || '';
+
+      // If id starts with provider prefix (e.g. "openrouter/deepseek/deepseek-v4.1-flash" with provider "openrouter"),
+      // strip it so T3 Code doesn't double-prefix it when building `${provider}/${id}`.
+      const prefix = `${provider}/`;
+      while (id.startsWith(prefix) && id.length > prefix.length) {
+        id = id.slice(prefix.length);
+      }
+
+      const name = item.name || id || item.id;
 
       const entry = {
         id,
@@ -88,7 +97,7 @@ class ModelCatalogManager {
       }
       // Fallback default minimal models if omp models command fails
       return [
-        { id: 'zai/glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'zai', reasoning: true, thinking: true },
+        { id: 'glm-5.3-flash', name: 'GLM 5.3 Flash', provider: 'zai', reasoning: true, thinking: true },
         { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: 'anthropic', reasoning: true }
       ];
     }
