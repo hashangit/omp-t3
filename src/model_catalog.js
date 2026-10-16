@@ -96,6 +96,7 @@ class ModelCatalogManager {
 
   /**
    * Synthesizes a valid T3 Code ModelInfo RPC response.
+   * Includes both data: { models } and models for maximum compatibility.
    * @param {string | number} reqId 
    * @param {string} [ompPath]
    * @returns {string} Stringified JSON response with newline
@@ -103,10 +104,13 @@ class ModelCatalogManager {
   createModelResponse(reqId, ompPath = 'omp') {
     const models = this.cachedModels || this.getModels(ompPath);
     const payload = {
-      id: reqId,
+      id: String(reqId),
       type: 'response',
       command: 'get_available_models',
       success: true,
+      data: {
+        models
+      },
       models
     };
     return JSON.stringify(payload) + '\n';
@@ -134,7 +138,7 @@ class ModelCatalogManager {
 
       return {
         intercepted: true,
-        response: this.createModelResponse(reqId, ompPath)
+        response: this.createModelResponse(reqId || '1', ompPath)
       };
     }
 

@@ -56,7 +56,27 @@ function createProxyPipeline(options) {
         return; // Intercepted: Do not forward to OMP
       }
 
-      // 3. Byte-preserving transparent passthrough
+      // 3. Gracefully answer get_commands if OMP does not support it
+      if (trimmed.includes('"type":"get_commands"') || trimmed.includes('"type": "get_commands"')) {
+        let reqId = '1';
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.id) reqId = String(parsed.id);
+        } catch {
+          const m = trimmed.match(/"id"\s*:\s*("([^"]+)"|(\d+))/);
+          if (m) reqId = m[2] !== undefined ? m[2] : m[3];
+        }
+        clientOut.write(JSON.stringify({
+          id: reqId,
+          type: 'response',
+          command: 'get_commands',
+          success: true,
+          data: { commands: [] }
+        }) + '\n');
+        return;
+      }
+
+      // 4. Byte-preserving transparent passthrough
       childIn.write(line + '\n');
     });
 
