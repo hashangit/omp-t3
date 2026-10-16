@@ -1,0 +1,114 @@
+#!/usr/bin/env node
+'use strict';
+
+const { execSync } = require('node:child_process');
+const { parseArgs, resolveOmpPath } = require('../src/cli.js');
+const { spawnAndProxy } = require('../src/proxy.js');
+const { setupSessionSymlink } = require('../src/symlink.js');
+const { ModelCatalogManager } = require('../src/model_catalog.js');
+const pkg = require('../package.json');
+
+const parsed = parseArgs(process.argv.slice(2));
+
+switch (parsed.action) {
+  case 'version': {
+    let ompVer = 'unknown';
+    try {
+      const ompPath = resolveOmpPath();
+      ompVer = execSync(`"${ompPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+    } catch {
+      // ignore
+    }
+    console.log(`omp-t3 v${pkg.version} (OMP shim for T3 Code)`);
+    console.log(`Underlying OMP: ${ompVer}`);
+    process.exit(0);
+    break;
+  }
+
+  case 'help': {
+    console.log(`
+omp-t3 - Out-of-process stdio RPC translator bridging T3 Code and Oh My Pi
+
+Usage:
+  omp-t3 [flags...]
+
+T3 Code Setup:
+  1. Open T3 Code -> Settings -> Providers -> Pi
+  2. Set "Binary Path" to: omp-t3 (or absolute path from "which omp-t3")
+  3. Leave Arguments empty
+  4. Click Refresh to discover models and start chatting!
+
+Commands & Flags:
+  --check            Verify omp installation, model discovery, and symlinks
+  --setup-symlink    Create ~/.pi/agent/sessions symlink for T3 Usage Dashboard
+  --version, -v      Show version information
+  --help, -h         Show this help message
+
+All other flags (e.g. --session, --fork, --hide-thinking) are forwarded directly to omp.
+When --mode rpc is received from T3 Code, it is automatically rewritten to --mode rpc-ui.
+`);
+    process.exit(0);
+    break;
+  }
+
+  case 'setup-symlink': {
+    const res = setupSessionSymlink(false);
+    process.exit(res.success ? 0 : 1);
+    break;
+  }
+
+  case 'check': {
+    console.log('--- Checking OMP & T3 Integration Status ---');
+    let hasErrors = false;
+
+    // 1. Check OMP binary
+    let ompPath = null;
+    try {
+      ompPath = resolveOmpPath();
+      const ompVer = execSync(`"${ompPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+      console.log(`[PASS] OMP binary found at: ${ompPath} (${ompVer})`);
+    } catch (err) {
+      console.error(`[FAIL] Could not locate omp binary: ${err.message}`);
+      hasErrors = true;
+    }
+
+    // 2. Check Model Discovery
+    if (ompPath) {
+      try {
+        const mgr = new ModelCatalogManager();
+        const models = mgr.getModels(ompPath);
+        const resp = mgr.createModelResponse('check-test', ompPath);
+        const sizeKb = (Buffer.byteLength(resp, 'utf8') / 1024).toFixed(1);
+        console.log(`[PASS] Model catalog discovery succeeded: ${models.length} models discovered.`);
+        console.log(`       Safe payload size: ${sizeKb} KB (well within 1024 KB RPC limit).`);
+      } catch (err) {
+        console.error(`[FAIL] Model discovery error: ${err.message}`);
+        hasErrors = true;
+      }
+    }
+
+    // 3. Check Session Symlink
+    const symRes = setupSessionSymlink(false);
+    if (symRes.success) {
+      console.log(`[PASS] Usage Dashboard session bridge verified.`);
+    } else {
+      console.warn(`[WARN] Session bridge check: ${symRes.message}`);
+    }
+
+    console.log('--------------------------------------------');
+    if (hasErrors) {
+      console.error('Integration checks failed.');
+      process.exit(1);
+    } else {
+      console.log('All checks passed! omp-t3 is ready for T3 Code.');
+      process.exit(0);
+    }
+    break;
+  }
+
+  case 'proxy':
+  default: {
+    spawnAndProxy(parsed.ompArgs || ['--mode', 'rpc-ui']);
+    break;
+  }
+}

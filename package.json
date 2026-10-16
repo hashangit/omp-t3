@@ -1,0 +1,28 @@
+{
+  "name": "omp-t3",
+  "version": "1.0.0",
+  "description": "Zero-modification stdio RPC translator shim bridging T3 Code and Oh My Pi (omp)",
+  "main": "src/proxy.js",
+  "bin": {
+    "omp-t3": "./bin/omp-t3"
+  },
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "./bin/omp-t3 --check"
+  },
+  "keywords": [
+    "t3code",
+    "t3",
+    "oh-my-pi",
+    "omp",
+    "rpc",
+    "shim",
+    "translator"
+  ],
+  "author": "hash",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
