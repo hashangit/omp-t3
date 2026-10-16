@@ -1,7 +1,7 @@
 # Implementation Tasks: OMP-to-T3 Code Translator Shim (`omp-t3`)
 
 **Feature**: `001-omp-t3-translator`  
-**Status**: Completed  
+**Status**: Completed & Verified  
 **Created**: 2026-10-17  
 
 ---
@@ -74,6 +74,16 @@
 
 ---
 
+### Phase 10: T3 Code Live Compatibility & Bug Fixes
+
+- [X] T022 Wrap get_available_models response with data: { models } alongside top-level models in src/model_catalog.js
+- [X] T023 Implement get_commands discovery stub in src/proxy.js
+- [X] T024 Fix model slug prefix duplication: strip redundant ${provider}/ in src/model_catalog.js and add defensive set_model normalizer in src/proxy.js
+- [X] T025 Add regression tests for model prefix stripping and set_model forwarding in test/model_catalog.test.js and test/e2e.test.js
+- [X] T026 Verify full turn execution live in T3 Code UI
+
+---
+
 ## Dependencies & Completion Order
 
 ```text
@@ -102,8 +112,7 @@ Phase 8 (US6: Usage & Session Symlink)
    │
    ▼
 Phase 9 (Polish, Health Check, Verification, README)
+   │
+   ▼
+Phase 10 (Live T3 Compatibility: Model Slug & Discovery Fixes)
 ```
-
-## Parallel Execution Opportunities
-- T006, T008, T011, T013, T015, T017 (Test creation tasks marked [P]) can be authored independently.
-- T007 (Settlement) and T012 (Model Catalog) operate on distinct files and can be developed independently before assembly in T009/T010.

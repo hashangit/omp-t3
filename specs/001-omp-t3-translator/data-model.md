@@ -1,7 +1,7 @@
 # Data Model & Protocol Entities
 
 **Feature**: `001-omp-t3-translator`  
-**Status**: Completed  
+**Status**: Completed & Verified  
 **Created**: 2026-10-17  
 
 ---
@@ -35,11 +35,15 @@ Represents a model in T3 Code's Pi provider format.
 
 ```typescript
 interface ModelInfo {
-  id: string;               // e.g. "zai/glm-5.3-flash" or "claude-3-5-sonnet-20241022"
-  name: string;             // Display name, e.g. "GLM-5.3-flash"
+  // Clean model identifier WITHOUT provider prefix.
+  // Note: T3 Code internally creates its composite slug via `${provider}/${id}`.
+  // Therefore, id must NOT contain the provider prefix (e.g. "glm-5.3-flash" for provider "zai",
+  // or "deepseek/deepseek-v4.1-flash" for provider "openrouter").
+  id: string;
+  name: string;             // Display name, e.g. "GLM-5.3 Flash"
   provider: string;         // e.g. "zai", "anthropic", "openai", "openrouter"
-  contextWindow?: number;   // e.g. 128000
-  maxTokens?: number;       // e.g. 8192
+  contextWindow?: number;   // e.g. 1048576
+  maxTokens?: number;       // e.g. 131072
   reasoning?: boolean;      // True if model supports reasoning/thinking
   thinking?: boolean;       // Alias for reasoning support
 }
@@ -61,14 +65,43 @@ interface ModelInfo {
 
 #### `get_available_models` (Intercepted)
 - **T3 Format**: `{"type": "get_available_models", "id": string | number}`
-- **Action**: Intercepted. Returns synthetic response:
+- **Action**: Intercepted. Returns synthetic response with dual `data.models` and `models` payload:
   ```json
   {
     "id": "<id>",
     "type": "response",
     "command": "get_available_models",
     "success": true,
+    "data": {
+      "models": [<ModelInfo>, ...]
+    },
     "models": [<ModelInfo>, ...]
+  }
+  ```
+
+#### `get_commands` (Intercepted)
+- **T3 Format**: `{"type": "get_commands", "id": string | number}`
+- **Action**: Intercepted. Returns synthetic response with empty command list:
+  ```json
+  {
+    "id": "<id>",
+    "type": "response",
+    "command": "get_commands",
+    "success": true,
+    "data": {
+      "commands": []
+    }
+  }
+  ```
+
+#### `set_model` (Normalized)
+- **T3 Format**: `{"type": "set_model", "provider": string, "modelId": string}`
+- **Action**: Normalized. If `modelId` begins with `${provider}/` (e.g. `openrouter/deepseek/...` from legacy thread slugs), `omp-t3` strips the redundant `${provider}/` prefix so OMP resolves the model correctly:
+  ```json
+  {
+    "type": "set_model",
+    "provider": "<provider>",
+    "modelId": "<cleanModelId>"
   }
   ```
 
@@ -100,7 +133,7 @@ interface ModelInfo {
 
 #### `turn_start` / `turn_end`
 - **OMP Format**: `{"type": "turn_start", ...}`, `{"type": "turn_end", "usage": {...}}`
-- **Action**: Passthrough untouched.
+- **Action**: Passthrough untouched (preserves token metrics).
 
 #### `message_start` / `message_update` / `message_end`
 - **OMP Format**:

@@ -1,7 +1,7 @@
 # Contract: Bidirectional JSONL RPC Protocol
 
 **Feature**: `001-omp-t3-translator`  
-**Status**: Completed  
+**Status**: Completed & Verified  
 **Created**: 2026-10-17  
 
 ---
@@ -10,7 +10,9 @@
 
 | Match Rule | Action | Output to OMP | Output to T3 |
 |---|---|---|---|
-| `line` contains `"type":"get_available_models"` | Intercept | None | `{"id": id, "type": "response", "command": "get_available_models", "success": true, "models": [...]}` |
+| `line` contains `"type":"get_available_models"` | Intercept | None | `{"id": id, "type": "response", "command": "get_available_models", "success": true, "data": {"models": [...]}, "models": [...]}` |
+| `line` contains `"type":"get_commands"` | Intercept | None | `{"id": id, "type": "response", "command": "get_commands", "success": true, "data": {"commands": []}}` |
+| `line` contains `"type":"set_model"` | Normalize | `normalized_set_model + '\n'` (redundant `${provider}/` stripped from `modelId`) | None |
 | `line` contains `"type":"prompt"` | Record turn start | `line + '\n'` | None |
 | `line` contains `"type":"abort"` | Set `aborted = true` | `line + '\n'` | None |
 | Any other line | Byte-Preserving Passthrough | `line + '\n'` | None |
@@ -25,7 +27,7 @@
 | `line` contains `"type":"prompt_result"` | Intercept & Suppress | None (record `status`) | None |
 | `line` contains `"type":"subagent_event"` or `"type":"task:subagent:event"` | Intercept & Normalize | `normalized_subagent_event + '\n'` | None |
 | `line` contains `"type":"advisor_cost_changed"` | Suppress | None | None |
-| Any other line (`message_update`, `tool_execution_*`, `ready`, etc.) | Byte-Preserving Passthrough | `line + '\n'` | None |
+| Any other line (`message_update`, `tool_execution_*`, `ready`, `turn_end`, etc.) | Byte-Preserving Passthrough | `line + '\n'` | None |
 
 ---
 
