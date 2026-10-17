@@ -289,3 +289,66 @@ test('E2E: local slash command renders output and settles the turn', async () =>
   assert.equal(settled.type, 'agent_settled');
   assert.equal(settled.aborted, false);
 });
+
+test('E2E: turn with pending background work settles per cycle, no hang', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  pipeline.start();
+
+  // 1. Main prompt cycle: omp streams, ends the cycle non-terminal, and
+  //    reports sessionSettled:false because a background job is still running.
+  //    No session_settled follows until that job drains.
+  clientIn.write('{"id":1,"type":"prompt","message":"start sleep 90 in background"}\n');
+  await new Promise((r) => setImmediate(r));
+  childOut.write('{"type":"agent_start"}\n');
+  childOut.write('{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Backgrounded as job bg_1."}}\n');
+  childOut.write('{"type":"tool_execution_start","toolCallId":"call_bg1","toolName":"bash","args":{"command":"sleep 90"}}\n');
+  childOut.write('{"type":"tool_execution_end","toolCallId":"call_bg1"}\n');
+  childOut.write('{"type":"agent_end","isTerminal":false}\n');
+  childOut.write('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}\n');
+  await new Promise((r) => setImmediate(r));
+
+  let frames = clientLines.lines.map((l) => JSON.parse(l));
+  let types = frames.map((f) => f.type);
+  assert.ok(types.includes('agent_end'), 'agent_end must pass through');
+  assert.equal(types.filter((t) => t === 'agent_settled').length, 1, 'cycle 1 must settle exactly once');
+  assert.ok(!types.includes('session_settled'), 'no session_settled reached T3');
+  assert.ok(!types.includes('prompt_result'), 'prompt_result stays suppressed');
+  const firstSettle = frames.filter((f) => f.type === 'agent_settled')[0];
+  assert.equal(firstSettle.aborted, false);
+
+  // 2. Steer cycle: omp answers the steer, ends the cycle, still no
+  //    session_settled (job pending). The turn must settle again.
+  clientIn.write('{"id":2,"type":"steer","message":"Done?"}\n');
+  await new Promise((r) => setImmediate(r));
+  childOut.write('{"type":"agent_start"}\n');
+  childOut.write('{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Yes, done."}}\n');
+  childOut.write('{"type":"agent_end","isTerminal":false}\n');
+  await new Promise((r) => setImmediate(r));
+
+  frames = clientLines.lines.map((l) => JSON.parse(l));
+  types = frames.map((f) => f.type);
+  assert.equal(types.filter((t) => t === 'agent_settled').length, 2, 'steer cycle must settle exactly once more');
+
+  // 3. Wake cycle: background job drained, omp delivers the result and the
+  //    wrap-up ends terminal with session_settled.
+  childOut.write('{"type":"agent_start"}\n');
+  childOut.write('{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Job bg_1 finished."}}\n');
+  childOut.write('{"type":"agent_end","isTerminal":true}\n');
+  childOut.write('{"type":"session_settled"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  frames = clientLines.lines.map((l) => JSON.parse(l));
+  types = frames.map((f) => f.type);
+  // Cycle synthesis + the translated session_settled both land for the wake
+  // cycle. The duplicate is deliberate: T3's settle probe is generation-
+  // guarded and finalizes once, and the extra settle keeps the translation
+  // path intact for adopted-wake replay buffers.
+  assert.equal(types.filter((t) => t === 'agent_settled').length, 4, 'wake cycle settles via synthesis + translation');
+  assert.ok(types.includes('session_settled') === false, 'session_settled is always translated, never forwarded');
+  assert.equal(types[types.length - 1], 'agent_settled');
+
+  pipeline.stop();
+});

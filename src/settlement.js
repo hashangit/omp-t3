@@ -13,6 +13,21 @@ class SettlementTracker {
     // Held auto_compaction_start line awaiting its end frame (skipped-pair
     // suppression - see handleDownstreamFrame).
     this.bufferedCompactionStart = null;
+    // Agent activity cycle tracking. omp emits agent_start/agent_end around
+    // every model cycle (prompt turn, steered reply, background-wake reply),
+    // but only follows agent_end with session_settled when NOTHING can wake
+    // the session again (prompt_result.sessionSettled === true). While
+    // background jobs or detached subagents are pending, omp withholds
+    // session_settled until that work drains - which can be minutes or
+    // never (long-lived dev servers). T3 finalizes a turn only on
+    // agent_settled, so the foreground turn must settle at the cycle
+    // boundary instead. Duplicated settles are safe: T3's settle probe is
+    // generation-guarded and idempotent.
+    this.cycleActive = false;
+    this.settledThisCycle = false;
+    // True between an upstream abort command and the next agent_start, so the
+    // synthesized settle for the aborted cycle reports aborted:true.
+    this.sawAbort = false;
   }
 
   /**
@@ -48,6 +63,7 @@ class SettlementTracker {
       line.includes('"type": "abort_and_prompt"')
     ) {
       this.lastPromptStatus = 'aborted';
+      this.sawAbort = true;
     }
     return null;
   }
@@ -122,6 +138,42 @@ class SettlementTracker {
       }
     }
 
+    // Agent cycle boundaries. Top-level type comparison (never substring):
+    // subagent_event payload events embed {"type":"agent_end"} for CHILD
+    // sessions, and those frames must still reach the subagent bridge.
+    if (line.includes('"agent_start"') || line.includes('"agent_end"')) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        parsed = null;
+      }
+      if (parsed && parsed.type === 'agent_start') {
+        this.cycleActive = true;
+        this.settledThisCycle = false;
+        this.sawAbort = false;
+        return { handled: false };
+      }
+      if (parsed && parsed.type === 'agent_end' && this.cycleActive) {
+        // Foreground cycle finished. Settle the T3 turn here instead of
+        // waiting for session_settled: omp withholds it whenever background
+        // work is pending (prompt_result.sessionSettled:false), which left
+        // runs active forever. Forward agent_end untouched (byte-passthrough
+        // invariant), then append the synthesized terminal.
+        this.cycleActive = false;
+        this.settledThisCycle = true;
+        const aborted = this.sawAbort || this.lastPromptStatus === 'aborted';
+        return {
+          handled: true,
+          suppress: false,
+          emit:
+            line + '\n' +
+            JSON.stringify({ type: 'agent_settled', aborted }) + '\n'
+        };
+      }
+      return { handled: false };
+    }
+
     // Local-only slash commands (e.g. /context, /stats) complete with the
     // response itself carrying data.agentInvoked:false; no prompt_result and
     // no session_settled ever follow, and T3's own command-only settle probe
@@ -152,18 +204,35 @@ class SettlementTracker {
 
     // Check for prompt_result
     if (line.includes('"type":"prompt_result"') || line.includes('"type": "prompt_result"')) {
+      let status = null;
+      let agentInvoked = false;
       try {
         const parsed = JSON.parse(line);
         if (parsed.status) {
           this.lastPromptStatus = parsed.status;
+          status = parsed.status;
         }
+        agentInvoked = parsed.agentInvoked === true;
       } catch {
         // Fallback simple regex if malformed
         if (line.includes('"aborted"')) {
-          this.lastPromptStatus = 'aborted';
+          this.lastPromptStatus = status = 'aborted';
         } else if (line.includes('"completed"')) {
-          this.lastPromptStatus = 'completed';
+          this.lastPromptStatus = status = 'completed';
         }
+      }
+      // Fallback cycle settle when no agent_end was observed for this turn
+      // (e.g. the shim attached mid-turn): agentInvoked:true means an agent
+      // cycle ran, so settle now rather than waiting for a session_settled
+      // that omp may withhold while background work is pending.
+      if (agentInvoked && !this.settledThisCycle) {
+        this.settledThisCycle = true;
+        this.cycleActive = false;
+        return {
+          handled: true,
+          suppress: false,
+          emit: JSON.stringify({ type: 'agent_settled', aborted: status === 'aborted' }) + '\n'
+        };
       }
       // Suppress prompt_result because T3 PiAdapter does not recognize it
       return { handled: true, suppress: true };
