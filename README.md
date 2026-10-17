@@ -29,11 +29,11 @@ npm install -g omp-t3
 Install from the tap:
 
 ```bash
-brew tap hashangit/seepient
+brew tap hashangit/omp-t3
 brew install omp-t3
 ```
 
-You can also install directly from this repository:
+You can also install directly from GitHub without tapping first:
 
 ```bash
 brew install hashangit/omp-t3/omp-t3
@@ -122,12 +122,6 @@ Run unit and integration tests:
 ```bash
 npm test
 ```
-
-Inspect planning documentation:
-- [Technical specification](planning_docs/omp-t3-translator-spec.md)
-- [Feature specification](specs/001-omp-t3-translator/spec.md)
-- [Implementation plan](specs/001-omp-t3-translator/plan.md)
-- [Task breakdown](specs/001-omp-t3-translator/tasks.md)
 
 ---
 

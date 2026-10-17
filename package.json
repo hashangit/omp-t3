@@ -1,6 +1,6 @@
 {
   "name": "omp-t3",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Zero-modification stdio RPC translator shim bridging T3 Code and Oh My Pi (omp)",
   "main": "src/proxy.js",
   "bin": {
