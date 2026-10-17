@@ -120,6 +120,7 @@ The check verifies that:
 - **Contract drift watchdog:** Every cleanly settled turn records the working `omp`/shim versions to `~/.local/state/omp-t3/contract-state.json`. If OMP breaks a protocol promise (e.g. stops emitting `session_settled` after announcing settlement) or discovery dies, the shim keeps the turn alive, prints a stderr banner naming the changed side with rollback guidance, and files a rate-limited issue on GitHub with sanitized diagnostics.
 - **Slug normalization:** Strips redundant provider prefixes from model IDs, preventing double-slug lookups like `openrouter/openrouter/...` during model selection.
 - **Subagent bridging:** Renames OMP's `task` tool executions to T3's `subagent` convention, merges OMP's live `details.progress[]` child list into the `details.results[]` entries T3's subagent UI reads, and (after opting into `set_subagent_subscription {level:"events"}` on the child's ready frame) translates OMP's `subagent_lifecycle`/`subagent_progress`/`subagent_event` frames into synthesized `tool_execution_update` frames carrying per-child status, model identity, and assistant text — so spawned subagents render as live cards in the T3 thread tree. Child events are always attributed to the `task` call that spawned them (omp attributes late events to whichever tool is currently active, which would leave orphaned never-finishing cards), and child state is pruned when the task call ends. Raw `subagent_*` frames are suppressed (T3's adapter ignores unknown event types).
+- **Command & skill menu:** Serves T3's `get_commands` polls from OMP's live catalog (cached from OMP's startup push, refreshed on demand): builtins like `/context`, `/stats`, `/usage`, and `/dump` appear in T3's `/` menu as extension commands, and OMP's skills (already named `skill:*`) land in T3's `$` skill menu with `source:"skill"`. OMP's richer source enum is projected onto Pi's `extension`/`prompt`/`skill` enum. When a command runs, OMP's `command_output` frames are re-emitted as rendered text inside the command-only turn — ANSI-stripped and wrapped in a fenced code block, because T3 renders assistant text as markdown (bare newlines collapse; a fence preserves omp's line-oriented bar-chart layout in monospace) — and the turn is settled from OMP's `data.agentInvoked:false` completion signal, which would otherwise hang, since local-only commands never emit `session_settled` and T3's own idle probe is suppressed once output rendered.
 - **Byte passthrough:** Everything else (token streaming deltas, diff streams, approvals, and terminal signals) passes through without JSON parsing overhead.
 
 ## CLI
@@ -133,6 +134,16 @@ The check verifies that:
 | `omp-t3 --setup-symlink` | Creates `~/.pi/agent/sessions` -> `~/.omp/agent/sessions` for T3 Code's historical usage dashboard. |
 | `omp-t3 --help` | Prints usage instructions and the T3 Code configuration guide. |
 
+## Provider errors & retries
+
+Occasionally a turn ends with a red **Provider error** card, typically `ECONNRESET: The socket connection was closed unexpectedly` — a mid-stream drop from the model endpoint (e.g. z.ai). What happens next:
+
+1. omp marks the turn failed (`stopReason:"error"`) and the shim passes the failure through faithfully — by design, real failures are never suppressed.
+2. T3 Code's own attempt retry re-runs the whole turn cleanly (the completed reply you see is the retry).
+3. The red card remains as the thread's record of the failed attempt. It is not an ongoing problem.
+
+omp also has its own session-scoped auto-retry, which omp-t3 deliberately leaves **off**: a mid-stream retry would re-run a response whose partial output is already committed to your thread, duplicating content. T3's attempt retry is the correct recovery layer for mid-stream drops.
+
 ## Development
 
 Run unit and integration tests:
@@ -144,6 +155,14 @@ npm test
 ---
 
 ## Changelog
+
+### 1.3.0-3
+
+- **Skills in T3's `$` menu.** OMP's skill catalog (26 skills, named `skill:*`) is now served through `get_commands` with Pi's `source:"skill"`, so they appear in T3 Code's `$` skill picker and run through `prompt` like native skills. Previously the shim answered every `get_commands` with an empty list, leaving both menus empty.
+- **OMP builtins in T3's `/` menu.** `/context`, `/stats`, `/usage`, `/dump`, `/jobs`, and the rest of OMP's builtin/custom/extension commands appear in T3's slash menu (mapped to Pi's `extension` source; markdown-backed `custom`/`file` commands map to `prompt`).
+- **Local command output renders in T3.** OMP runs builtin slash commands locally and emits `command_output` frames T3 knows nothing about; the shim re-emits each as rendered text inside the command-only turn, ANSI-stripped and wrapped in a fenced code block so T3's markdown renderer keeps omp's aligned bar-chart layout instead of collapsing newlines into a run-on paragraph.
+- **Local-only commands settle.** OMP completes local commands with `data.agentInvoked:false` on the RPC response — no `prompt_result`, no `session_settled` — and T3's own idle probe is suppressed once a turn renders output. The shim synthesizes the terminal `agent_settled` from that signal, so `/context` no longer leaves the turn active forever.
+- `get_commands` answers now echo the caller's request id with its original JSON type (numeric ids were previously stringified).
 
 ### 1.3.0-2
 

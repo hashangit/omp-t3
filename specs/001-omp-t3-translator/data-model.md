@@ -39,6 +39,13 @@ interface TranslatorState {
   taskCalls: Set<string>;
   activeTaskCall: string | null;
 
+  // Command bridge (src/commands.js)
+  commands: RawOmpCommand[] | null;  // last catalog from available_commands_update
+                                     // or the injected get_available_commands refresh
+  pendingRefresh: { reqId: string; timer: NodeJS.Timeout; deliver: () => void } | null;
+  // single-flight cold-cache fill; bounded 2.5s fallback answers get_commands
+  // with an empty list so T3's init probe can never stall
+
   // Contract doctor (src/doctor.js)
   subagentSubscriptionSent: boolean;
   settleTimer: NodeJS.Timeout | null;

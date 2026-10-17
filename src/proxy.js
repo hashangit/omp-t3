@@ -7,6 +7,7 @@ const os = require('node:os');
 const { SettlementTracker } = require('./settlement.js');
 const { ModelCatalogManager } = require('./model_catalog.js');
 const { SubagentBridge } = require('./subagent.js');
+const { CommandBridge } = require('./commands.js');
 const { resolveOmpPath } = require('./cli.js');
 const { setupSessionSymlink } = require('./symlink.js');
 const { ContractDoctor } = require('./doctor.js');
@@ -27,6 +28,7 @@ function createProxyPipeline(options) {
     doctor = new ContractDoctor({ shimVersion: pkg.version }),
     modelManager = new ModelCatalogManager((err) => doctor.reportDiscoveryFailure(err)),
     subagentBridge = new SubagentBridge(),
+    commandBridge = new CommandBridge(),
     ompPath = 'omp'
   } = options;
 
@@ -67,23 +69,24 @@ function createProxyPipeline(options) {
         return; // Intercepted: Do not forward to OMP
       }
 
-      // 3. Gracefully answer get_commands if OMP does not support it
+      // 3. Serve get_commands from OMP's live catalog (translated to the Pi
+      //    dialect) instead of an empty list — this populates T3's `/` and `$`
+      //    menus with OMP's builtins and skills.
       if (trimmed.includes('"type":"get_commands"') || trimmed.includes('"type": "get_commands"')) {
         let reqId = '1';
         try {
           const parsed = JSON.parse(trimmed);
-          if (parsed.id) reqId = String(parsed.id);
+          // Echo the id with its original JSON type — T3 correlates by value.
+          if (parsed.id !== undefined && parsed.id !== null) reqId = parsed.id;
         } catch {
           const m = trimmed.match(/"id"\s*:\s*("([^"]+)"|(\d+))/);
           if (m) reqId = m[2] !== undefined ? m[2] : m[3];
         }
-        clientOut.write(JSON.stringify({
-          id: reqId,
-          type: 'response',
-          command: 'get_commands',
-          success: true,
-          data: { commands: [] }
-        }) + '\n');
+        commandBridge.answerGetCommands(
+          reqId,
+          (refreshLine) => childIn.write(refreshLine),
+          (answer) => clientOut.write(answer)
+        );
         return;
       }
 
@@ -136,14 +139,24 @@ function createProxyPipeline(options) {
         return;
       }
 
-      // 2. Check subagent bridge
+      // 2. Check command bridge (catalog pushes, injected refresh responses,
+      //    local command_output -> rendered turn output)
+      const cmdResult = commandBridge.handleDownstreamFrame(trimmed);
+      if (cmdResult.handled) {
+        if (cmdResult.emit) {
+          clientOut.write(cmdResult.emit);
+        }
+        return;
+      }
+
+      // 3. Check subagent bridge
       const subResult = subagentBridge.handleDownstreamFrame(trimmed);
       if (subResult.handled && subResult.line) {
         clientOut.write(subResult.line);
         return;
       }
 
-      // 3. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
+      // 4. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
       clientOut.write(line + '\n');
     });
   }
@@ -160,7 +173,8 @@ function createProxyPipeline(options) {
     stop,
     settlementTracker,
     modelManager,
-    subagentBridge
+    subagentBridge,
+    commandBridge
   };
 }
 

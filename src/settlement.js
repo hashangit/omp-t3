@@ -122,6 +122,34 @@ class SettlementTracker {
       }
     }
 
+    // Local-only slash commands (e.g. /context, /stats) complete with the
+    // response itself carrying data.agentInvoked:false; no prompt_result and
+    // no session_settled ever follow, and T3's own command-only settle probe
+    // is suppressed once the turn has rendered output. Synthesize the
+    // terminal agent_settled here; forward the original response untouched.
+    if (line.includes('"agentInvoked":false')) {
+      try {
+        const parsed = JSON.parse(line);
+        if (
+          parsed.type === 'response' &&
+          parsed.command === 'prompt' &&
+          parsed.success === true &&
+          parsed.data &&
+          parsed.data.agentInvoked === false
+        ) {
+          return {
+            handled: true,
+            suppress: false,
+            emit:
+              line + '\n' +
+              JSON.stringify({ type: 'agent_settled', aborted: this.lastPromptStatus === 'aborted' }) + '\n'
+          };
+        }
+      } catch {
+        // Fall through to the other handlers.
+      }
+    }
+
     // Check for prompt_result
     if (line.includes('"type":"prompt_result"') || line.includes('"type": "prompt_result"')) {
       try {

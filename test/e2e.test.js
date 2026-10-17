@@ -191,3 +191,101 @@ test('E2E: manual compact renders synthesized compaction cards and forwards resp
   assert.equal(fwd.command, 'compact');
   assert.equal(fwd.success, true);
 });
+
+test('E2E: get_commands serves OMP catalog and skills reach the Pi dialect', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  const childLines = collectLines(childIn);
+  pipeline.start();
+
+  // OMP pushes its catalog at startup; T3 must never see the raw frame.
+  childOut.write(JSON.stringify({
+    type: 'available_commands_update',
+    commands: [
+      { name: 'context', description: 'Show context usage', source: 'builtin' },
+      { name: 'skill:commit', description: 'Commit staged changes', source: 'skill' }
+    ]
+  }) + '\n');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(clientLines.lines.length, 0);
+
+  // T3 polls get_commands; the bridge answers from cache without touching OMP.
+  clientIn.write('{"id":"probe-1","type":"get_commands"}\n');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(childLines.lines.length, 0); // served from cache
+  assert.equal(clientLines.lines.length, 1);
+  const resp = JSON.parse(clientLines.lines[0]);
+  assert.equal(resp.id, 'probe-1');
+  assert.equal(resp.command, 'get_commands');
+  assert.equal(resp.success, true);
+  assert.deepEqual(resp.data.commands, [
+    { name: 'context', description: 'Show context usage', source: 'extension' },
+    { name: 'skill:commit', description: 'Commit staged changes', source: 'skill' }
+  ]);
+});
+
+test('E2E: cold get_commands triggers one injected refresh and answers', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  const childLines = collectLines(childIn);
+  pipeline.start();
+
+  clientIn.write('{"id":5,"type":"get_commands"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  // One get_available_commands injected into OMP, no answer to T3 yet.
+  assert.equal(childLines.lines.length, 1);
+  const injected = JSON.parse(childLines.lines[0]);
+  assert.match(injected.id, /^ompt3-cmds-\d+$/);
+  assert.equal(clientLines.lines.length, 0);
+
+  // OMP responds; T3 gets its translated answer and the raw response is suppressed.
+  childOut.write(JSON.stringify({
+    id: injected.id, type: 'response', success: true,
+    data: { commands: [{ name: 'stats', description: 'Stats dashboard', source: 'builtin' }] }
+  }) + '\n');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(childLines.lines.length, 1); // no further traffic to OMP
+  assert.equal(clientLines.lines.length, 1);
+  const resp = JSON.parse(clientLines.lines[0]);
+  assert.equal(resp.id, 5);
+  assert.deepEqual(resp.data.commands, [
+    { name: 'stats', description: 'Stats dashboard', source: 'extension' }
+  ]);
+});
+
+test('E2E: local slash command renders output and settles the turn', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  pipeline.start();
+
+  // T3 runs /context as a prompt; OMP echoes the prompt through.
+  clientIn.write('{"id":77,"type":"prompt","message":"/context"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  // OMP streams command output, then completes locally.
+  childOut.write(JSON.stringify({ type: 'command_output', text: '\x1b[32mContext window:\x1b[39m 1% used' }) + '\n');
+  childOut.write('{"id":77,"type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}\n');
+  await new Promise((r) => setImmediate(r));
+
+  const frames = clientLines.lines.map((l) => JSON.parse(l));
+  const rendered = frames.find((f) => f.type === 'message_update');
+  assert.ok(rendered, 'command output must render inside the turn');
+  assert.equal(rendered.assistantMessageEvent.type, 'text_end');
+  assert.match(rendered.assistantMessageEvent.content, /^```/);
+  assert.match(rendered.assistantMessageEvent.content, /Context window: 1% used/);
+
+  const response = frames.find((f) => f.type === 'response' && f.id === 77);
+  assert.ok(response, 'prompt response must still reach T3');
+  assert.equal(response.data.agentInvoked, false);
+
+  const settled = frames[frames.length - 1];
+  assert.equal(settled.type, 'agent_settled');
+  assert.equal(settled.aborted, false);
+});

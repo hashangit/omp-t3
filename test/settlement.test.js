@@ -198,3 +198,31 @@ test('auto compaction: end without buffered start still translates (real failed 
   assert.equal(end.type, 'compaction_end');
   assert.equal(end.errorMessage, 'provider exploded');
 });
+
+test('SettlementTracker synthesizes agent_settled for local-only commands (agentInvoked:false)', () => {
+  const tracker = new SettlementTracker();
+  const response = '{"id":9,"type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}';
+  const res = tracker.handleDownstreamFrame(response);
+  assert.equal(res.handled, true);
+  assert.equal(res.suppress, false); // original response still reaches T3
+  const lines = res.emit.trim().split('\n');
+  assert.equal(lines.length, 2);
+  assert.deepEqual(JSON.parse(lines[0]), JSON.parse(response));
+  const settled = JSON.parse(lines[1]);
+  assert.equal(settled.type, 'agent_settled');
+  assert.equal(settled.aborted, false);
+});
+
+test('SettlementTracker leaves agent-invoked prompt responses untouched', () => {
+  const tracker = new SettlementTracker();
+  const res = tracker.handleDownstreamFrame(
+    '{"id":10,"type":"response","command":"prompt","success":true,"data":{"agentInvoked":true}}'
+  );
+  assert.equal(res.handled, false);
+
+  // Non-prompt responses mentioning the field must not trigger either
+  const other = tracker.handleDownstreamFrame(
+    '{"id":11,"type":"response","command":"get_state","success":true,"data":{"agentInvoked":false}}'
+  );
+  assert.equal(other.handled, false);
+});

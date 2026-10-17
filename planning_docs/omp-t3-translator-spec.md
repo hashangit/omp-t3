@@ -14,6 +14,7 @@ When pointing T3 Code's Pi provider to the `omp` binary directly, turns fail or 
 6. **Subagent UI Incompatibility:** T3 renders subagent cards purely from Pi-convention tool-execution updates (`toolName:"subagent"`, `details.results[]`). omp names its tool `task`, attributes late child events to whichever tool is currently active, and reports children under inconsistent identities — cards go missing, split into orphans, or never terminate.
 7. **Manual Compaction Silence:** omp's RPC `compact()` handler emits no compaction events at all (it awaits the whole compaction and answers once), so T3's UI shows nothing for `/compact`, and omp's benign `success:false` ("Nothing to compact (session too small)") lands on T3's turn-failure path.
 8. **Auto-Compaction Cascade Noise:** omp's auto-compaction is a method cascade (`handoff`/`shake`/`context-full`) whose `skipped:true` attempts carry no `result` — forwarded raw, T3 renders each as "Context compaction failed".
+9. **Command & Skill Isolation:** omp explicitly does not serve Pi's `get_commands` (its richer catalog is not wire-compatible), so the shim answered T3's polls with an empty list — T3's `/` menu exposed none of omp's 76 commands (`/context`, `/stats`, `/usage`, …) and its `$` menu none of omp's 26 skills. omp also runs builtin commands locally (`command_output` frames, completing with `data.agentInvoked:false` on the response — no `prompt_result`, no `session_settled`), a shape T3 neither renders nor settles.
 
 ### The Solution: Zero-Fork Architecture
 Rather than maintaining brittle forks of T3 Code or `omp`, the **Translator Shim** acts as a lightweight proxy:
@@ -26,6 +27,7 @@ Rather than maintaining brittle forks of T3 Code or `omp`, the **Translator Shim
 - Persists every successful model discovery to `~/.cache/omp-t3/models.json` and serves the last-known list (flagged stale) when live discovery fails.
 - Synthesizes the manual-`/compact` event pair around omp's single response, and drops `skipped:true` auto-compaction pairs entirely.
 - Re-parents subagent events to the spawning `task` call so each child yields exactly one always-terminating T3 node.
+- Projects omp's live command catalog onto Pi's `RpcSlashCommand[]` (skills stay `skill:`-named for T3's `$` menu), renders `command_output` inside the command-only turn, and synthesizes the `agent_settled` terminal from omp's `agentInvoked:false` completion.
 - Watches for contract drift (`src/doctor.js`): records last-known-good versions, synthesizes settlement when omp withholds it, and reports drift upstream.
 
 ```mermaid
@@ -66,6 +68,9 @@ When T3 Code starts a turn or initializes a thread, it spawns `binaryPath` with 
 | `{"type": "ready", ...}` | Cache protocol limits (`maxFrameBytes`) | `{"type": "ready", ...}` | Passthrough. |
 | `{"type": "prompt_result", "status": s, "agentInvoked": a}` | Store `lastPromptStatus = s` | Suppressed (or converted to Pi response ack if pending) | Pi adapter does not consume OMP's `prompt_result` frame. |
 | `{"type": "session_settled"}` | Read `lastPromptStatus` | `{"type": "agent_settled", "aborted": (s == "aborted")}` | **Solves #19490.** Emits terminal frame expected by T3 `PiAdapter`. |
+| `{"type": "response", "command": "prompt", "data": {"agentInvoked": false}}` | Read `lastPromptStatus` | Original response unchanged, then `{"type": "agent_settled", "aborted": ...}` | Local-only slash commands (`/context`, `/stats`, …) complete via the response; no `prompt_result`/`session_settled` follows and T3's idle probe is suppressed once output rendered. |
+| `{"type": "available_commands_update", "commands": [...]}` | Cache catalog (CommandBridge) | Suppressed | Pi's dialect is poll-only; the cache backs `get_commands` answers. |
+| `{"type": "command_output", "text": t}` | Strip ANSI, fence | `{"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 0, "content": fenced block}}` | T3 renders assistant text as markdown (newlines collapse); a fenced block preserves omp's monospace bar-chart layout. Swallowed when empty. |
 | `{"type": "turn_start"}` | Update turn state | `{"type": "turn_start"}` | Passthrough. |
 | `{"type": "turn_end", ...}` | Update turn state | `{"type": "turn_end", ...}` | Passthrough (preserves live usage metrics). |
 | `{"type": "message_start", ...}` | None | `{"type": "message_start", ...}` | Passthrough. |
@@ -145,6 +150,12 @@ In T3's `packages/provider-pi/src/server/adapter.ts`:
 - `package.json` version = `<pi-major>.<pi-minor>.<pi-patch>-<iteration>` (e.g. `1.3.0-1`). The first three segments track the upstream Pi release this iteration targets; the prerelease counter is the shim's own npm publish level (npm rejects literal 4-segment versions; prerelease sorts correctly: `1.3.0-9 < 1.3.0-10 < 1.4.0-1`).
 - `--version` prints the Pi base on line 1 (T3's gate parses the first semver token, requires >= 0.80.5) and the full identity on line 2. Package-derived, offline, instant.
 
+### 4.6 Command & Skill Catalog Bridge (`src/commands.js`)
+- **Discovery:** omp pushes its catalog via `available_commands_update` at startup and on metadata changes; Pi's dialect is poll-only (`get_commands`). The bridge caches every push (suppressing the raw frame — T3's adapter ignores unknown event types anyway) and serves polls from cache. A cold poll (push lost or not yet arrived) injects one single-flight `get_available_commands` (id `ompt3-cmds-<n>`) into omp and answers when it responds, with a 2.5s bounded fallback that answers empty so T3's init probe can never stall — preserving the original empty-answer guarantee for initialization.
+- **Projection:** omp's richer source enum maps onto Pi's `RpcSlashCommand[]`: `skill` → `skill` (omp names are already `skill:`-prefixed, so they land in T3's `$` picker unchanged), `builtin`/`extension` → `extension` (handler-executed), `custom`/`file` → `prompt` (markdown templates); unknown sources default to `extension`. `description` is always a string; omp's `aliases`/`subcommands`/`input.hint` have no Pi counterpart and are dropped. Request ids echo with their original JSON type.
+- **Local command turns:** omp executes builtins (`/context`, `/stats`, …) locally, streaming `command_output` frames and completing with `data.agentInvoked:false` on the RPC response — no `prompt_result`, no `session_settled`. The bridge re-emits each output as a `message_update`/`text_end` inside the command-only turn, ANSI-stripped and wrapped in a fenced code block (`toMarkdownBlock`, fence grows past inner backtick runs per CommonMark) because T3 renders assistant text as markdown and bare newlines would collapse omp's bar-chart layout; monospace-in-a-fence realigns it. The settlement tracker then forwards the response unchanged and synthesizes the terminal `agent_settled` — required because T3's own command-only idle probe is suppressed once a turn renders output (`sawAgentActivity`), so without synthesis the turn would stay active forever.
+- **Deliberate omission:** omp's `set_auto_retry` stays off. Its retry is session-scoped and would re-run **mid-stream** failures whose partial output is already committed to the thread, duplicating content; T3's harness-level attempt retry re-runs the whole turn cleanly and is the correct recovery layer for mid-stream drops (e.g. provider `ECONNRESET`).
+
 ---
 
 ## 5. Technical Implementation Blueprint
@@ -187,6 +198,12 @@ Users configure T3 Code to use the translator via GUI Settings or `~/.t3/userdat
    - Spawn a `task` subagent through the shim; verify T3 renders live subagent cards (status, model, progress text) and synthesized `tool_execution_update` frames arrive per child state change.
 8. **Contract Drift Test:**
    - Feed a `prompt_result` with `sessionSettled:true` and withhold `session_settled`; verify the watchdog synthesizes `agent_settled`, prints rollback guidance, and rate-limits issue filing.
+9. **Command Catalog Test (`test/commands.test.js`, `test/e2e.test.js`):**
+   - Feed an `available_commands_update` push, poll `get_commands`, verify the Pi-dialect projection (skills stay `skill:`-named with `source:"skill"`), that the raw push is suppressed, and that a cold poll triggers exactly one injected `ompt3-cmds-<n>` refresh with a bounded empty-answer fallback.
+10. **Local Command Turn Test:**
+    - Run `/context` as a `prompt`; verify `command_output` renders as a fenced markdown block inside the turn, the `agentInvoked:false` response forwards unchanged, and exactly one synthesized `agent_settled` settles the turn.
+11. **Live Binary Smoke:**
+    - Drive `bin/omp-t3` against the real `omp` in an isolated profile (`-p` + `--session-dir`): 76-command catalog with 26 `skill:*` entries served, `/context` bars aligned inside the fence, single `agent_settled`.
 
 ---
 
