@@ -13,7 +13,9 @@
  * - Source mapping: OMP's richer catalog (builtin/extension/custom/file/skill)
  *   is projected onto Pi's `extension`/`prompt`/`skill` enum. OMP skill names
  *   are already `skill:`-prefixed, matching Pi's convention, so they land in
- *   T3's `$` skill menu unchanged.
+ *   T3's `$` skill menu unchanged. T3's bundled MCP extension needs each
+ *   skill's file path through a different channel (the extension's in-process
+ *   `getCommands()`); see src/extension_compat.js.
  * - Local slash-command output: OMP runs builtin commands (e.g. `/context`,
  *   `/stats`) locally and emits `command_output` text frames instead of
  *   starting an agent run. T3 has no such frame, so each one is re-emitted as

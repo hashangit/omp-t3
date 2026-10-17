@@ -55,6 +55,7 @@ When T3 Code starts a turn or initializes a thread, it spawns `binaryPath` with 
 | `--fork <id>` | `--fork <id>` | Passthrough. OMP natively supports session branch/rollback. |
 | `--hide-thinking` | `--hide-thinking` | Passthrough. Supported by OMP. |
 | `--approval-mode <m>` | `--approval-mode <m>` | Passthrough (or mapped if T3 passes permission overrides). |
+| `--extension <…/pi-t3-mcp-extension.ts>` | `--extension <~/.cache/omp-t3/pi-t3-mcp-extension.compat.ts>` | T3's bundled MCP bridge resolves `$name` skills via Pi's `command.sourceInfo.path`; OMP's in-process commands carry the same location as `command.path`. The shim launches a content-addressed copy of the extension whose `getCommands()` view projects `command.path` into `sourceInfo.path`, and repoints `T3_PI_MCP_EXTENSION_PATH` to the copy so its tool-ownership identity check still matches. Marker mismatch (upstream source drift) → original passed through with a stderr warning. |
 | Unknown / Bridge flags | Evaluated / Filtered | Strips any T3-specific extension flags that OMP's CLI parser would reject. |
 
 ---

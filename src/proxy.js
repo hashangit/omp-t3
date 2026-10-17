@@ -181,8 +181,12 @@ function createProxyPipeline(options) {
 /**
  * Spawns OMP child process and starts proxying standard I/O.
  * @param {string[]} ompArgs Arguments to pass to omp
+ * @param {{ t3ExtensionPath?: string }} [options] When the launched T3
+ *   extension is the shim-managed adapted copy, its path replaces the
+ *   incoming T3_PI_MCP_EXTENSION_PATH so the extension's own tool-ownership
+ *   identity check keeps matching the file omp actually loaded.
  */
-function spawnAndProxy(ompArgs) {
+function spawnAndProxy(ompArgs, options = {}) {
   const ompPath = resolveOmpPath();
 
   // Ensure ~/.pi/agent/sessions -> ~/.omp/agent/sessions symlink exists for T3 usage scraper
@@ -199,6 +203,9 @@ function spawnAndProxy(ompArgs) {
     ...process.env,
     PI_CODING_AGENT_DIR: path.join(os.homedir(), '.omp', 'agent')
   };
+  if (options.t3ExtensionPath) {
+    childEnv.T3_PI_MCP_EXTENSION_PATH = options.t3ExtensionPath;
+  }
   const child = spawn(ompPath, ompArgs, {
     stdio: ['pipe', 'pipe', 'inherit'],
     env: childEnv

@@ -4,6 +4,7 @@
 const { parseArgs, resolveOmpPath, shimVersionInfo } = require('../src/cli.js');
 const { execSync } = require('node:child_process');
 const { spawnAndProxy } = require('../src/proxy.js');
+const { adaptT3ExtensionArgs } = require('../src/extension_compat.js');
 const { setupSessionSymlink } = require('../src/symlink.js');
 const { ModelCatalogManager } = require('../src/model_catalog.js');
 const pkg = require('../package.json');
@@ -108,7 +109,15 @@ When --mode rpc is received from T3 Code, it is automatically rewritten to --mod
 
   case 'proxy':
   default: {
-    spawnAndProxy(parsed.ompArgs || ['--mode', 'rpc-ui']);
+    const ompArgs = parsed.ompArgs || ['--mode', 'rpc-ui'];
+    adaptT3ExtensionArgs(ompArgs)
+      .then(({ args, extensionPath }) => {
+        spawnAndProxy(args, extensionPath ? { t3ExtensionPath: extensionPath } : {});
+      })
+      .catch((err) => {
+        console.error(`[omp-t3] Extension adaptation failed (${err && err.message ? err.message : err}); launching without it.`);
+        spawnAndProxy(ompArgs);
+      });
     break;
   }
 }
