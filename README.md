@@ -1,117 +1,136 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.svg" width="64" height="64" alt="omp-t3 icon">
 
-# OMP-T3: Zero-Fork Translator Shim for T3 Code & Oh My Pi
+# omp-t3
 
-An out-of-process, zero-modification stdio RPC proxy that seamlessly bridges [T3 Code](https://t3.codes)'s Pi provider adapter with [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp` v18.x+).
+Run Oh My Pi inside T3 Code.
 
----
+T3 Code includes a provider for upstream Pi. Pointing that provider directly at `omp` breaks three things:
 
-## Why OMP-T3?
+1. Turn settlement. `omp` sends `session_settled` when code generation ends, but T3 Code waits for `agent_settled`. Turns stay stuck in an active state.
+2. Tool approvals. T3 Code spawns agents with `--mode rpc`. That flag mutes interactive confirmation dialogs in `omp`, so bash and file approval prompts never appear.
+3. Model discovery. `omp` lists more than 500 models across 60 providers in a single RPC response. That payload blows past the 1 MB frame limit and kills the connection.
 
-When pointing T3 Code directly to the `omp` binary, three fundamental protocol mismatches break the experience:
-
-1. **Turn Settlement Mismatch ([T3 Code #19490](https://github.com/pingdotgg/t3code/issues/19490)):**  
-   OMP emits `session_settled` (preceded by `prompt_result`), while T3 Code's Pi adapter treats only upstream Pi's `agent_settled` frame as terminal. Without this, turns hang indefinitely.
-2. **Permission & Extension UI Suppression:**  
-   T3 Code spawns agent processes strictly with `--mode rpc`. In OMP, plain `rpc` mode mutes interactive approval dialogs (`extension_ui_request`). OMP requires `--mode rpc-ui` to un-mute permissions.
-3. **Transport Frame Limit Overflow:**  
-   When T3 queries `get_available_models`, OMP tries to serialize its complete catalog (580+ models across 60+ providers) into a single JSON line exceeding its internal 1MB frame limit (`maxFrameBytes: 1048576`), crashing model discovery.
-
-`omp-t3` resolves all three issues transparently while passing 95%+ of unchanged traffic (diff streams, thinking tokens, bash executions, and rollbacks) through as raw bytes.
+`omp-t3` sits between T3 Code and `omp` over stdio. It translates settlement frames, enables `--mode rpc-ui`, prunes the model catalog to stay under frame limits, and forwards normal streaming traffic untouched.
 
 ---
 
-## Architecture
+## Installation
 
-```text
-       +---------------------------------------------+
-       |                   T3 Code                   |
-       |  (packages/provider-pi/src/server/adapter)  |
-       +---------------------------------------------+
-                            ^
-                            | stdio (JSONL lines)
-                            v
-       +---------------------------------------------+
-       |                  omp-t3                     |
-       |  +---------------------------------------+  |
-       |  | CLI Rewriter: --mode rpc -> rpc-ui    |  |
-       |  +---------------------------------------+  |
-       |  | Stream Demuxer & Byte Passthrough     |  |
-       |  +---------------------------------------+  |
-       |  | Settlement Filter:                    |  |
-       |  |   prompt_result -> suppress           |  |
-       |  |   session_settled -> agent_settled    |  |
-       |  +---------------------------------------+  |
-       |  | Model Interceptor:                    |  |
-       |  |   get_available_models -> pruned safe |  |
-       |  +---------------------------------------+  |
-       |  | Subagent Bridge:                      |  |
-       |  |   task:subagent:event -> subagent     |  |
-       |  +---------------------------------------+  |
-       |  | Signals & Exit Code Mirroring         |  |
-       |  +---------------------------------------+  |
-       +---------------------------------------------+
-                            ^
-                            | stdio (JSONL lines)
-                            v
-       +---------------------------------------------+
-       |                    omp                      |
-       |       (/home/linuxbrew/.linuxbrew/bin/omp)  |
-       +---------------------------------------------+
-```
+### With npm
 
----
+Install globally using npm:
 
-## Quickstart & Setup in T3 Code
-
-### 1. Verify Prerequisites
-Run the built-in diagnostic check:
 ```bash
-./bin/omp-t3 --check
+npm install -g omp-t3
 ```
-Output:
+
+### With Homebrew
+
+Install from the tap:
+
+```bash
+brew tap hashangit/seepient
+brew install omp-t3
+```
+
+You can also install directly from this repository:
+
+```bash
+brew install hashangit/omp-t3/omp-t3
+```
+
+### Run without installing
+
+You can test `omp-t3` directly through npx:
+
+```bash
+npx omp-t3 --check
+```
+
+---
+
+## Setup in T3 Code
+
+1. Open **Settings** -> **Providers** -> **Pi**.
+2. Set **Binary Path** to `omp-t3` (or the full path from `which omp-t3`).
+3. Leave **Arguments** blank. `omp-t3` defaults to `--mode rpc-ui` automatically.
+4. Click **Refresh** to populate your configured models.
+5. Select your model and send a message.
+
+---
+
+## Verify your environment
+
+Run the built-in diagnostic check:
+
+```bash
+omp-t3 --check
+```
+
+The check verifies that:
+- The `omp` binary exists in your `$PATH` and responds to CLI queries.
+- Model discovery runs and produces a payload well below the 1 MB transport ceiling.
+- The session directory link between `~/.pi/agent/sessions` and `~/.omp/agent/sessions` is active, allowing T3 Code's usage view to read historical token metrics.
+
+---
+
+## How it works
+
 ```text
---- Checking OMP & T3 Integration Status ---
-[PASS] OMP binary found at: /home/linuxbrew/.linuxbrew/bin/omp (omp/18.11.1)
-[PASS] Model catalog discovery succeeded: 580 models discovered.
-       Safe payload size: 94.5 KB (well within 1024 KB RPC limit).
-[PASS] Usage Dashboard session bridge verified.
---------------------------------------------
-All checks passed! omp-t3 is ready for T3 Code.
++---------------------------------------------+
+|                   T3 Code                   |
+|  (packages/provider-pi/src/server/adapter)  |
++---------------------------------------------+
+                      ^
+                      | stdio (JSONL lines)
+                      v
++---------------------------------------------+
+|                   omp-t3                    |
+|  - Rewrites --mode rpc to --mode rpc-ui     |
+|  - Translates session_settled to            |
+|    agent_settled                            |
+|  - Intercepts get_available_models and      |
+|    prunes heavy schemas                     |
+|  - Answers get_commands discovery probes    |
+|  - Strips duplicate provider slugs          |
+|  - Passes diffs, tokens, and bash logs      |
+|    through as raw bytes                     |
++---------------------------------------------+
+                      ^
+                      | stdio (JSONL lines)
+                      v
++---------------------------------------------+
+|                     omp                     |
+|               (local binary)                |
++---------------------------------------------+
 ```
 
-### 2. Configure T3 Code
-1. Open **T3 Code** -> **Settings** -> **Providers** -> **Pi**.
-2. Set **Binary Path** to:
-   ```text
-   /var/home/hash/.t3/projects/omp-t3/bin/omp-t3
-   ```
-   *(or `omp-t3` if symlinked/installed to `$PATH`)*.
-3. Leave **Arguments** blank (no flags required; `omp-t3` defaults to `--mode rpc-ui`).
-4. Click **Refresh** to populate your configured models (Z.ai GLM-5.3-flash, Claude, DeepSeek, etc.).
-5. Start chatting!
+### Protocol translation
+
+- **CLI rewrite:** Converts incoming `--mode rpc` to `--mode rpc-ui` so `omp` emits permission requests instead of suppressing them.
+- **Settlement mapping:** Captures `prompt_result` status, catches `session_settled`, and emits `agent_settled` with the right `aborted` boolean so T3 Code marks the turn complete.
+- **Model catalog pruning:** Queries `omp models --json`, drops pricing arrays and verbose schemas, and returns clean entries with both `data.models` and top-level `models`.
+- **Slug normalization:** Strips redundant provider prefixes from model IDs, preventing double-slug lookups like `openrouter/openrouter/...` during model selection.
+- **Byte passthrough:** Everything else (token streaming deltas, diff streams, approvals, and terminal signals) passes through without JSON parsing overhead.
 
 ---
 
-## Key Features & Invariants
+## Development
 
-- **Zero-Flag UX**: User provides zero CLI flags in T3 Code settings; `omp-t3` automatically supplies `--mode rpc-ui`.
-- **Byte-Preserving Passthrough**: Non-intercepted frames bypass JSON deserialization and re-encoding entirely.
-- **Signal Forwarding**: `SIGINT`, `SIGTERM`, and `SIGHUP` propagate immediately to the child process group.
-- **Exit Code Mirroring**: Exits with the exact code returned by `omp`.
-- **Session Dashboard Bridge**: Automatically links `~/.pi/agent/sessions` -> `~/.omp/agent/sessions` so T3's native Usage Dashboard indexes your historical OMP token spend.
+Run unit and integration tests:
 
----
-
-## Development & Testing
-
-Run the test suite:
 ```bash
 npm test
 ```
 
-Inspect planning and design documentation:
-- [Planning Specification](file:///var/home/hash/.t3/projects/omp-t3/planning_docs/omp-t3-translator-spec.md)
-- [Feature Specification](file:///var/home/hash/.t3/projects/omp-t3/specs/001-omp-t3-translator/spec.md)
-- [Implementation Plan](file:///var/home/hash/.t3/projects/omp-t3/specs/001-omp-t3-translator/plan.md)
-- [Task Breakdown](file:///var/home/hash/.t3/projects/omp-t3/specs/001-omp-t3-translator/tasks.md)
+Inspect planning documentation:
+- [Technical specification](planning_docs/omp-t3-translator-spec.md)
+- [Feature specification](specs/001-omp-t3-translator/spec.md)
+- [Implementation plan](specs/001-omp-t3-translator/plan.md)
+- [Task breakdown](specs/001-omp-t3-translator/tasks.md)
+
+---
+
+## License
+
+MIT

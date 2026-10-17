@@ -4,12 +4,29 @@
   "description": "Zero-modification stdio RPC translator shim bridging T3 Code and Oh My Pi (omp)",
   "main": "src/proxy.js",
   "bin": {
-    "omp-t3": "./bin/omp-t3"
+    "omp-t3": "bin/omp-t3"
   },
+  "files": [
+    "bin",
+    "src",
+    "assets",
+    "README.md"
+  ],
   "type": "commonjs",
   "scripts": {
     "test": "node --test test/*.test.js",
     "check": "./bin/omp-t3 --check"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hashangit/omp-t3.git"
+  },
+  "homepage": "https://github.com/hashangit/omp-t3#readme",
+  "bugs": {
+    "url": "https://github.com/hashangit/omp-t3/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "t3code",
