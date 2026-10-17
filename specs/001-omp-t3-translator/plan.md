@@ -52,7 +52,8 @@
        |  |   set_model -> strips duplicate prefix       |  |
        |  +----------------------------------------------+  |
        |  | Subagent Bridge:                             |  |
-       |  |   task:subagent:event -> subagent            |  |
+       |  |   subagent_* frames + toolName:"task"        |  |
+       |  |   -> synthesized subagent tool cards         |  |
        |  +----------------------------------------------+  |
        |  | Signals & Exit Code Mirroring                |  |
        |  +----------------------------------------------+  |

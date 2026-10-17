@@ -27,6 +27,40 @@ interface TranslatorState {
   childPid: number | null;
   childExited: boolean;
   exitCode: number | null;
+
+  // Subagent bridge: parentToolCallId -> (child id -> T3 results entry)
+  // with accumulated assistant text for piSubagentOutput
+  subagentsByCall: Map<string, Map<string, SubagentEntry>>;
+  // Task tool call ids seen (tool_execution_start with toolName "task"), and
+  // the most recent one. Subagent frames are re-parented to the spawning
+  // task call (other tools never steal ownership — omp attributes late child
+  // events to the currently-active tool, which orphaned T3 nodes); each
+  // call's child map is pruned on its tool_execution_end.
+  taskCalls: Set<string>;
+  activeTaskCall: string | null;
+
+  // Contract doctor (src/doctor.js)
+  subagentSubscriptionSent: boolean;
+  settleTimer: NodeJS.Timeout | null;
+  lastGood: { ompVersion: string; shimVersion: string; at: number } | null;  // persisted to
+                                                                            // ~/.local/state/omp-t3/contract-state.json
+  issuesFiled: Record<string, number>;  // drift signature -> last issue timestamp (24h rate limit)
+
+  // Model catalog persistence (stale-fallback chain)
+  servingStale: boolean;  // true while the served list is not from a live discovery
+  // persistedModels: { savedAt: number, models: ModelInfo[] } written to
+  // ~/.cache/omp-t3/models.json on every successful discovery (setCachedModels)
+  // and served (with a stderr stale notice) when live discovery fails.
+
+  // Manual compact synthesis: T3 sent {"type":"compact"} and the synthesized
+  // compaction_start went downstream; cleared when omp's command:"compact"
+  // response crosses downstream (compaction_end synthesized around it).
+  pendingManualCompact: boolean;
+
+  // Held auto_compaction_start line awaiting its end frame; pair is dropped
+  // when the end reports skipped:true (omp method-cascade noise that T3
+  // would otherwise render as "Context compaction failed").
+  bufferedCompactionStart: string | null;
 }
 ```
 
@@ -45,7 +79,10 @@ interface ModelInfo {
   contextWindow?: number;   // e.g. 1048576
   maxTokens?: number;       // e.g. 131072
   reasoning?: boolean;      // True if model supports reasoning/thinking
-  thinking?: boolean;       // Alias for reasoning support
+  // Pi-convention thinking ladder. Built from OMP's `thinking: [levels]`
+  // array. T3 ignores a boolean `thinking` field — do not emit one.
+  thinkingLevelMap?: { off: 'off'|null; minimal: 'minimal'|null; low: 'low'|null;
+                       medium: 'medium'|null; high: 'high'|null; xhigh: 'xhigh'|null; max: 'max'|null };
 }
 ```
 
@@ -146,6 +183,10 @@ interface ModelInfo {
 - **OMP Format**: `{"type": "extension_ui_request", "id": string, "dialog": {...}}`
 - **Action**: Passthrough untouched to T3 Code.
 
-#### `task:subagent:event` / `subagent_event`
-- **OMP Format**: `{"type": "task:subagent:event", ...}`
-- **Action**: Transformed to T3's subagent event structure.
+#### `subagent_lifecycle` / `subagent_progress` / `subagent_event`
+- **OMP Format** (gated by upstream `set_subagent_subscription {level:"events"}`, sent once after the child `ready` frame):
+  - `{"type": "subagent_lifecycle", "payload": {"id", "agent", "parentToolCallId", "status": "started|completed|aborted", "index"}}`
+  - `{"type": "subagent_progress", "payload": {"index", "agent", "task", "parentToolCallId", "progress": {"id", "status", "task", "recentOutput", "resolvedModelIdentity", ...}}}`
+  - `{"type": "subagent_event", "payload": {"id", "parentToolCallId", "event": {"type": "message_end|tool_execution_start|agent_end|...", "message": {...}}}}`
+- **Action**: Consumed, never forwarded raw (T3's adapter ignores unknown event types). Synthesizes `{"type":"tool_execution_update","toolCallId":<parentToolCallId>,"toolName":"subagent","partialResult":{"content":[],"details":{"results":[entries]}}}` where each entry carries `agent`, `task`, `step`, `finished`, optional `stopReason`/`exitCode`/`model`/`messages` — exactly the fields T3's `emitSubagentTasks` and `piSubagentOutput` read to render live subagent cards.
+- **Superseded**: the original `task:subagent:event -> subagent_event` rename rule was dead code — OMP has never emitted that frame type. Removed.

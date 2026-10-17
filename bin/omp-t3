@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
+const { parseArgs, resolveOmpPath, shimVersionInfo } = require('../src/cli.js');
 const { execSync } = require('node:child_process');
-const { parseArgs, resolveOmpPath } = require('../src/cli.js');
 const { spawnAndProxy } = require('../src/proxy.js');
 const { setupSessionSymlink } = require('../src/symlink.js');
 const { ModelCatalogManager } = require('../src/model_catalog.js');
@@ -12,15 +12,15 @@ const parsed = parseArgs(process.argv.slice(2));
 
 switch (parsed.action) {
   case 'version': {
-    let ompVer = 'unknown';
-    try {
-      const ompPath = resolveOmpPath();
-      ompVer = execSync(`"${ompPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-    } catch {
-      // ignore
-    }
-    console.log(`omp-t3 v${pkg.version} (OMP shim for T3 Code)`);
-    console.log(`Underlying OMP: ${ompVer}`);
+    // T3 probes the provider binary with --version and compares the first
+    // semver token of stdout against MINIMUM_PI_VERSION (0.80.5). The first
+    // three segments of our version track the upstream Pi release this shim
+    // iteration targets (`<pi>-<iter>` in package.json), so line 1 is exactly
+    // that Pi base. No other version-shaped token may appear in the output.
+    const info = shimVersionInfo();
+    if (!info) process.exit(1);
+    console.log(info.piBase);
+    console.log(`omp-t3 ${info.full} (Pi-compatible shim)`);
     process.exit(0);
     break;
   }

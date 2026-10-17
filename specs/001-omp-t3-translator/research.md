@@ -74,6 +74,7 @@
 - **Rationale**:
   - T3's UI monitors tool calls named `subagent` to render child agent status cards.
   - OMP uses tool name `task` and emits subagent events over RPC. Normalizing these names ensures T3's subagent visualization operates without modification.
+- **Superseded (drift fix, 2026-10-17)**: OMP never emits `task:subagent:event` — real frames are `subagent_lifecycle`/`subagent_progress`/`subagent_event` (gated by `set_subagent_subscription`), and OMP's wire frames key the tool as `toolName:"task"`. The implemented mapping renames `toolName` and synthesizes `tool_execution_update` cards from the subagent frames; see `contracts/rpc-contract.md` §2 and `planning_docs/omp-t3-translator-spec.md` §3/§4.4.
 
 ---
 

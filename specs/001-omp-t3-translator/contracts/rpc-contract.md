@@ -10,28 +10,51 @@
 
 | Match Rule | Action | Output to OMP | Output to T3 |
 |---|---|---|---|
-| `line` contains `"type":"get_available_models"` | Intercept | None | `{"id": id, "type": "response", "command": "get_available_models", "success": true, "data": {"models": [...]}, "models": [...]}` |
+| `line` contains `"type":"get_available_models"` | Intercept | None | `{"id": id, "type": "response", "command": "get_available_models", "success": true, "stale": true?, "data": {"models": [...]}, "models": [...]}` — entries carry `id`,`name`,`provider`,`contextWindow?`,`maxTokens?`,`reasoning?`,`thinkingLevelMap?` (never a boolean `thinking`; T3 ignores it). `stale` is present only when the list is not freshly discovered. Fallback order on live-discovery failure: in-memory cache → persisted catalog (`~/.cache/omp-t3/models.json`, written on every successful discovery) → builtin minimal list (absolute last resort, first run only). Every fallback emits a stderr notice naming the stale source. |
 | `line` contains `"type":"get_commands"` | Intercept | None | `{"id": id, "type": "response", "command": "get_commands", "success": true, "data": {"commands": []}}` |
 | `line` contains `"type":"set_model"` | Normalize | `normalized_set_model + '\n'` (redundant `${provider}/` stripped from `modelId`) | None |
-| `line` contains `"type":"prompt"` | Record turn start | `line + '\n'` | None |
-| `line` contains `"type":"abort"` | Set `aborted = true` | `line + '\n'` | None |
-| Any other line | Byte-Preserving Passthrough | `line + '\n'` | None |
+| `line` contains `"type":"prompt"` | Record turn start (reset settlement state) | `line + '\n'` | None |
+| `line` contains `"type":"abort"` or `"type":"abort_and_prompt"` | Set `aborted = true` | `line + '\n'` | None |
+| First `{"type":"ready"}` seen downstream (see §2) | Inject subscription | `{"type":"set_subagent_subscription","level":"events"} + '\n'` | None — sent once per shim process so OMP forwards subagent frames |
+| `line` contains `"type":"compact"` | Intercept (synthesize) | `line + '\n'` (untouched) | `{"type":"compaction_start","reason":"user_requested","action":"manual"} + '\n'` — omp's manual `compact()` RPC handler emits **no** compaction events (it awaits the whole compaction and answers once), so the shim synthesizes the Pi start card on request. |
+| Any other line (`get_state`, `set_thinking_level`, `set_session_name`, `extension_ui_response`, …) | Byte-Preserving Passthrough | `line + '\n'` | None |
 
 ---
 
 ## 2. Downstream Interceptor Matrix (OMP -> T3)
 
+Order matters: settlement → subagent bridge → passthrough. The contract doctor observes every line (§3) before settlement handling.
+
 | Match Rule | Action | Output to T3 | Output to OMP |
 |---|---|---|---|
-| `line` contains `"type":"session_settled"` | Intercept & Translate | `{"type": "agent_settled", "aborted": <aborted_status>} + '\n'` | None |
-| `line` contains `"type":"prompt_result"` | Intercept & Suppress | None (record `status`) | None |
-| `line` contains `"type":"subagent_event"` or `"type":"task:subagent:event"` | Intercept & Normalize | `normalized_subagent_event + '\n'` | None |
+| `line` contains `"type":"session_settled"` | Intercept & Translate | `{"type": "agent_settled", "aborted": <aborted_status>} + '\n'`; records last-known-good versions (doctor) | None |
+| `line` contains `"type":"prompt_result"` | Intercept & Suppress; arms settle watchdog when `agentInvoked && sessionSettled` (see §3) | None (records `status`) | None |
+| `line` contains `"command":"get_state"` with `success:true` and `data.queuedMessageCount` | Enrich | Same response + `data.pendingMessageCount = data.queuedMessageCount` (T3's settle probe finalizes on this field) | None |
+| `line` contains `"type":"auto_compaction_start"` | Buffer (suppress) | None | `{"type":"compaction_start", ...}` is **held** until the matching end arrives (see next row) |
+| `line` contains `"type":"auto_compaction_end"` | Conditional forward | `held compaction_start + {"type":"compaction_end", ...}` — auto-compaction success carries `result.{summary,shortSummary?,firstKeptEntryId,tokensBefore,...}` (verified against omp 18.11.3 binary + live frames); T3 reads `summary`/`tokensBefore`/`estimatedTokensAfter` (last is absent in omp — optional). Ends with `"skipped":true` (omp's method-cascade attempts: handoff/shake/context-full — this method didn't apply) are **dropped together with their buffered start**: they carry no `result`, and T3 renders any result-less end as "Context compaction failed". Aborted and genuinely-failed pairs (no result, no `skipped`) forward so T3 renders stopped/failed cards. | None |
+| `pendingManualCompact && line` is `{"type":"response","command":"compact",...}` | Intercept (synthesize) | None | `{"type":"compaction_end","aborted":false,"willRetry":false,"result":{"summary":data.summary|"Context compacted.","tokensBefore":data.tokensBefore?}}` on `success:true`, or `{"type":"compaction_end","aborted":false,"willRetry":false,"errorMessage":error}` on `success:false`, then the **original response forwarded unchanged** (T3 matches it to clear its in-flight flag and schedule the settle probe). Synthesis order guarantees T3's `sawCompaction` is set, so omp's benign `success:false` ("Nothing to compact (session too small)") renders a failed card instead of failing the whole turn. |
+| `line` contains `"type":"subagent_lifecycle"` / `"subagent_progress"` / `"subagent_event"` | Consume & synthesize | `{"type":"tool_execution_update","toolCallId":<parentToolCallId>,"toolName":"subagent","partialResult":{"content":[],"details":{"results":[entries]}}} + '\n'` where entries carry `agent`,`task`,`step`,`finished`,`stopReason?`,`exitCode?`,`model?`,`messages?` (assistant text snapshots — T3's `piSubagentOutput` reads these for card progress/result). Raw `subagent_*` frames are suppressed: T3 ignores unknown event types. **Parent attribution:** the update is anchored to the `task` tool call that spawned the child — omp's explicit `parentToolCallId` is honored only when it is a known `task` call; later tools (`wait`, bash) never steal ownership, so one child yields exactly one T3 node (`<taskCallId>:subagent:<step>`) that always reaches a terminal state. If no `task` call was ever seen (shim attached mid-turn), the explicit parent is anchored as-is. A child reported under the tool name `task` is re-titled to its own id (T3 titles nodes with `agent`). Child state maps are pruned when the owning task call ends. | None |
+| `tool_execution_start/update/end` with top-level `toolName:"task"` (or legacy `tool`/`name`) | Rename tool & normalize results | Same frame with `toolName:"subagent"`; `result.details.progress[]` merged into `result.details.results[]` (T3 requires string `agent`+`task` per entry) | None |
 | `line` contains `"type":"advisor_cost_changed"` | Suppress | None | None |
-| Any other line (`message_update`, `tool_execution_*`, `ready`, `turn_end`, etc.) | Byte-Preserving Passthrough | `line + '\n'` | None |
+| Any other line (`message_update`, `ready`, `turn_end`, `available_commands_update`, `extension_ui_request`, etc.) | Byte-Preserving Passthrough | `line + '\n'` | None |
 
 ---
 
-## 3. Byte-Preserving Passthrough Contract
+## 3. Contract Drift Watchdog (src/doctor.js)
+
+Runtime detection of upstream contract changes, per the project's drift-prevention policy:
+
+| Signal | Detection | Action |
+|---|---|---|
+| Clean turn settle | `agent_settled` emitted | Records `{ompVersion, shimVersion, at}` as **last known good** in `~/.local/state/omp-t3/contract-state.json` |
+| OMP stops emitting `session_settled` after announcing it (`prompt_result` with `agentInvoked:true && sessionSettled:true`, no `session_settled` within 15s) | Watchdog fires | Synthesizes `{"type":"agent_settled", ...}` so the turn never hangs; stderr banner names the changed side, last-good version, and the rollback command; files a GitHub issue on `hashangit/omp-t3` (once per drift signature per 24h; via `gh` when authenticated, else a prefilled issue URL) |
+| Model discovery dies (`omp models --json` unparseable/empty, no cache) | `ModelCatalogManager.onError` | Same report path; T3 falls back to custom models only |
+
+The watchdog NEVER suppresses user-visible failures — it reports *and* keeps the protocol alive.
+
+---
+
+## 4. Byte-Preserving Passthrough Contract
 
 For maximum performance and zero risk of JSON formatting regressions:
 1. Lines that do not trigger interceptor conditions MUST NOT be passed through `JSON.parse` or `JSON.stringify`.

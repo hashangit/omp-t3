@@ -9,25 +9,31 @@ const { ModelCatalogManager } = require('./model_catalog.js');
 const { SubagentBridge } = require('./subagent.js');
 const { resolveOmpPath } = require('./cli.js');
 const { setupSessionSymlink } = require('./symlink.js');
+const { ContractDoctor } = require('./doctor.js');
+const pkg = require('../package.json');
+
 
 /**
  * Creates the bidirectional stdio proxy pipeline.
  */
 function createProxyPipeline(options) {
+
   const {
     clientIn,
     clientOut,
     childIn,
     childOut,
     settlementTracker = new SettlementTracker(),
-    modelManager = new ModelCatalogManager(),
+    doctor = new ContractDoctor({ shimVersion: pkg.version }),
+    modelManager = new ModelCatalogManager((err) => doctor.reportDiscoveryFailure(err)),
     subagentBridge = new SubagentBridge(),
     ompPath = 'omp'
   } = options;
 
   let rlClient = null;
   let rlChild = null;
-
+  let subagentSubscriptionSent = false;
+  doctor.onSynth = (line) => clientOut.write(line);
   function start() {
     rlClient = readline.createInterface({
       input: clientIn,
@@ -46,8 +52,13 @@ function createProxyPipeline(options) {
       const trimmed = line.trim();
       if (!trimmed) return;
 
-      // 1. Notify settlement tracker of incoming turn commands
-      settlementTracker.handleUpstreamFrame(trimmed);
+      // 1. Notify settlement tracker of incoming turn commands; a manual
+      //    compact request also synthesizes a downstream compaction_start
+      //    (omp's manual compact emits no compaction events of its own).
+      const upstreamResult = settlementTracker.handleUpstreamFrame(trimmed);
+      if (upstreamResult && upstreamResult.emit) {
+        clientOut.write(upstreamResult.emit);
+      }
 
       // 2. Intercept get_available_models
       const modelResult = modelManager.handleUpstreamFrame(trimmed, ompPath);
@@ -104,13 +115,23 @@ function createProxyPipeline(options) {
     // Downstream stream: OMP -> Translator -> Client (T3 Code)
     rlChild.on('line', (line) => {
       const trimmed = line.trim();
-      if (!trimmed) return;
+      // 0. On the child's ready frame, opt into subagent frame forwarding so
+      //    the bridge can enrich T3's subagent cards with live status/text.
+      if (!subagentSubscriptionSent && trimmed.includes('"type":"ready"')) {
+        subagentSubscriptionSent = true;
+        childIn.write(JSON.stringify({ type: 'set_subagent_subscription', level: 'events' }) + '\n');
+      }
+
+      // 0.5 Contract doctor: arms the settle watchdog on OMP's settlement
+      //     announcement, clears it on session_settled.
+      doctor.observeDownstream(trimmed);
 
       // 1. Check settlement tracker (session_settled -> agent_settled, prompt_result)
       const settleResult = settlementTracker.handleDownstreamFrame(trimmed);
       if (settleResult.handled) {
         if (!settleResult.suppress && settleResult.emit) {
           clientOut.write(settleResult.emit);
+          if (settleResult.emit.includes('"agent_settled"')) doctor.noteSettled();
         }
         return;
       }
@@ -130,7 +151,9 @@ function createProxyPipeline(options) {
   function stop() {
     if (rlClient) rlClient.close();
     if (rlChild) rlChild.close();
+    doctor.stop();
   }
+
 
   return {
     start,
@@ -151,19 +174,17 @@ function spawnAndProxy(ompArgs) {
   // Ensure ~/.pi/agent/sessions -> ~/.omp/agent/sessions symlink exists for T3 usage scraper
   setupSessionSymlink(true);
 
-  // Pre-warm model catalog cache in background so get_available_models is instantaneous
-  const modelManager = new ModelCatalogManager();
-  try {
-    modelManager.getModels(ompPath);
-  } catch {
-    // Ignore pre-warm failure; will retry on demand
-  }
+  const doctor = new ContractDoctor({ shimVersion: pkg.version });
+  const modelManager = new ModelCatalogManager((err) => doctor.reportDiscoveryFailure(err));
+  // Pre-warm model catalog cache so get_available_models is instantaneous.
+  // MUST be async: a synchronous execSync here stalls every frame until the
+  // omp models --json subprocess finishes (~0.6s+ with the real binary).
+  modelManager.prewarm(ompPath);
 
   const childEnv = {
     ...process.env,
     PI_CODING_AGENT_DIR: path.join(os.homedir(), '.omp', 'agent')
   };
-
   const child = spawn(ompPath, ompArgs, {
     stdio: ['pipe', 'pipe', 'inherit'],
     env: childEnv
@@ -175,8 +196,10 @@ function spawnAndProxy(ompArgs) {
     childIn: child.stdin,
     childOut: child.stdout,
     modelManager,
+    doctor,
     ompPath
   });
+  doctor.init(ompPath);
 
   pipeline.start();
 

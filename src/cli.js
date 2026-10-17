@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
+const pkg = require('../package.json');
 
 /**
  * Parses incoming CLI arguments and translates them for OMP execution.
@@ -95,7 +96,27 @@ function resolveOmpPath() {
   throw new Error('Could not locate "omp" binary in PATH or standard directories. Please set OMP_PATH environment variable.');
 }
 
+/**
+ * Derives the shim's version identity from package.json.
+ *
+ * Version scheme: `<pi-major>.<pi-minor>.<pi-patch>-<iteration>` (npm-legal
+ * encoding of a 4th iteration level; npm rejects literal `1.3.0.1`). The first
+ * three segments track the upstream Pi release this shim iteration targets;
+ * the prerelease segment is the shim's own publish counter.
+ *
+ * T3's provider gate parses only the first `\d+\.\d+\.\d+` token of the
+ * `--version` output, so we report the Pi base alone on line 1.
+ * @param {string} [version] package.json version
+ * @returns {{ piBase: string, iteration: string, full: string } | null}
+ */
+function shimVersionInfo(version = pkg.version) {
+  const m = /^(\d+\.\d+\.\d+)(?:-(\d+))?$/.exec(version);
+  if (!m) return null;
+  return { piBase: m[1], iteration: m[2] || '0', full: version };
+}
+
 module.exports = {
   parseArgs,
-  resolveOmpPath
+  resolveOmpPath,
+  shimVersionInfo
 };

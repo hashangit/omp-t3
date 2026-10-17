@@ -11,6 +11,9 @@ When pointing T3 Code's Pi provider to the `omp` binary directly, turns fail or 
 3. **Transport Frame Limit Overflow:** `omp` supports 60+ providers with hundreds of models. When T3 queries `get_available_models`, `omp`'s unpaginated response exceeds its internal 1MB frame limit (`maxFrameBytes: 1048576`), triggering `"RPC response exceeded the transport limit"` and breaking model discovery.
 4. **Model Slug & ID Prefix Duplication:** T3 Code's Pi provider constructs model slugs as `${provider}/${id}`. If the model catalog returns `id` containing the provider prefix (e.g. `openrouter/deepseek/deepseek-v4.1-flash`), T3 Code constructs double-prefixed slugs (`openrouter/openrouter/...`), causing turn initiation via `set_model` to fail with `"Model not found"`.
 5. **Command Discovery Query Missing:** T3 Code's provider initialization probes `get_commands`. If unhandled, initialization stalls or logs warnings.
+6. **Subagent UI Incompatibility:** T3 renders subagent cards purely from Pi-convention tool-execution updates (`toolName:"subagent"`, `details.results[]`). omp names its tool `task`, attributes late child events to whichever tool is currently active, and reports children under inconsistent identities — cards go missing, split into orphans, or never terminate.
+7. **Manual Compaction Silence:** omp's RPC `compact()` handler emits no compaction events at all (it awaits the whole compaction and answers once), so T3's UI shows nothing for `/compact`, and omp's benign `success:false` ("Nothing to compact (session too small)") lands on T3's turn-failure path.
+8. **Auto-Compaction Cascade Noise:** omp's auto-compaction is a method cascade (`handoff`/`shake`/`context-full`) whose `skipped:true` attempts carry no `result` — forwarded raw, T3 renders each as "Context compaction failed".
 
 ### The Solution: Zero-Fork Architecture
 Rather than maintaining brittle forks of T3 Code or `omp`, the **Translator Shim** acts as a lightweight proxy:
@@ -20,6 +23,10 @@ Rather than maintaining brittle forks of T3 Code or `omp`, the **Translator Shim
 - Synthesizes `agent_settled` from `session_settled`, preserves approval flows, and handles model catalog truncation safely.
 - Strips redundant provider prefixes from model IDs in the catalog and defends against double-prefixed `set_model` frames from older thread states.
 - Answers `get_commands` queries with a compliant empty command list.
+- Persists every successful model discovery to `~/.cache/omp-t3/models.json` and serves the last-known list (flagged stale) when live discovery fails.
+- Synthesizes the manual-`/compact` event pair around omp's single response, and drops `skipped:true` auto-compaction pairs entirely.
+- Re-parents subagent events to the spawning `task` call so each child yields exactly one always-terminating T3 node.
+- Watches for contract drift (`src/doctor.js`): records last-known-good versions, synthesizes settlement when omp withholds it, and reports drift upstream.
 
 ```mermaid
 flowchart LR
@@ -67,7 +74,12 @@ When T3 Code starts a turn or initializes a thread, it spawns `binaryPath` with 
 | `{"type": "extension_ui_request", ...}` | Forward dialog | `{"type": "extension_ui_request", ...}` | Delivers permission/approval modal requests to T3 UI. |
 | `{"type": "advisor_cost_changed"}` | Ignored | Suppressed | OMP-internal feature; unhandled by T3. |
 | `{"type": "available_commands_update"}` | None | `{"type": "available_commands_update", ...}` | Passthrough. |
-| `{"type": "task:subagent:event", ...}` | Normalize subagent card | `{"type": "subagent_event", ...}` | Normalizes subagent events. |
+| `subagent_*` frames | See synthesized `tool_execution_update` rows below | — | **Superseded:** OMP never emits `task:subagent:event`; the original rename rule was dead code and was removed. |
+| `{"type": "auto_compaction_start", ...}` | Buffered (suppressed) | Held until the matching end frame | Auto-compaction is a method cascade in omp: attempts emit `reason`/`action` (`handoff`/`shake`/`context-full`) and frequently end `skipped:true`. |
+| `{"type": "auto_compaction_end", ...}` | Conditional forward | `compaction_start` (held) + `compaction_end`, or nothing | Success carries `result.{summary, shortSummary?, firstKeptEntryId, tokensBefore, ...}` (verified against omp 18.11.3 binary + live frames); T3 reads `summary`/`tokensBefore`/`estimatedTokensAfter` (absent in omp — optional). **`skipped:true` pairs are dropped entirely**: no `result`, and T3 renders any result-less end as "Context compaction failed" — they are cascade noise, not failures. Aborted/failed pairs forward (stopped/failed cards). |
+| Upstream `{"type": "compact", customInstructions?}` (manual `/compact`) | Compaction events synthesized | Frame forwarded untouched; downstream `{"type":"compaction_start","reason":"user_requested","action":"manual"}` | **Own solution.** omp's manual `compact()` RPC handler never emits compaction events — it awaits the whole compaction and answers with a single response. The shim synthesizes `compaction_start` on the request and `compaction_end` (result on success, `errorMessage` on failure) around omp's `command:"compact"` response, which is still forwarded so T3 can clear its in-flight flag and settle the turn. Without this, T3 shows nothing for manual compaction and a benign "Nothing to compact (session too small)" failure would fail the whole T3 turn. |
+| `{"type": "subagent_lifecycle"}` / `subagent_progress` / `subagent_event` | Track per-child state by `parentToolCallId` + `id`; **re-parent to the spawning `task` call** | Synthesized `{"type":"tool_execution_update","toolCallId":<taskCallId>,"toolName":"subagent","partialResult":{"details":{"results":[…]}}}` | Opt-in via `set_subagent_subscription {level:"events"}` sent after the child `ready` frame. Entries carry `agent`,`task`,`step`,`finished`,`stopReason?`,`model?`,`messages?` (assistant text → T3 card progress/result). Raw frames suppressed (T3 ignores unknown types). **Decision: own solution** (no T3-native equivalent for OMP async children). **Parent attribution (drift fix):** omp attributes late child events (completion during a later `wait`/bash call) to the currently-active tool; trusting that split one child into several T3 nodes keyed `<parent>:subagent:<step>`, some never terminating — the shim anchors every frame to the `task` call that spawned the child, prunes state when that call ends, and re-titles children reported under the tool name `task` to their own id. |
+| `{"type": "prompt_result", "sessionSettled": true}` then no `session_settled` within 15s | Contract-drift watchdog fires | Synthesized `{"type":"agent_settled", ...}` + stderr rollback notice + rate-limited GitHub issue | **Decision: own solution** — see `src/doctor.js`. Never hang a turn on drift. |
 
 ### 3.2 Upstream (T3 Code $\rightarrow$ Translator $\rightarrow$ OMP)
 
@@ -81,6 +93,10 @@ When T3 Code starts a turn or initializes a thread, it spawns `binaryPath` with 
 | `{"type": "set_thinking_level", "level": ...}` | Passthrough | `{"type": "set_thinking_level", ...}` |
 | `{"type": "compact"}` | Passthrough | `{"type": "compact"}` |
 | `{"type": "extension_ui_response", ...}` | Passthrough user approval/denial | `{"type": "extension_ui_response", ...}` |
+| `{"type": "get_state"}` | Passthrough; downstream response gains `pendingMessageCount` alias (from `queuedMessageCount`) | Passthrough + enriched response | T3's settle probe finalizes only on `pendingMessageCount === 0`. |
+| `{"type": "set_session_name"}` / `set_thinking_level` / `compact` / `extension_ui_response` | Passthrough | unchanged | OMP supports these natively. |
+| `get_session_stats` / `get_messages` / `get_entries` / `get_last_assistant_text` | Passthrough | unchanged | OMP supports these natively (v18.11 spec). **Decision: no stub needed.** |
+| Model catalog `thinking: [levels]` | Converted in prune | `reasoning: true` + `thinkingLevelMap {off..max: level|null}` | **Decision: own solution** — T3 ignores the boolean `thinking`; the map gates the Thinking option ladder. |
 
 ---
 
@@ -101,6 +117,7 @@ In T3's `packages/provider-pi/src/server/adapter.ts`:
 
 ### 4.2 Safe Model Catalog Delivery & Slug Compatibility
 - In OMP v18.x, querying `get_available_models` attempts to serialize hundreds of models across all providers into one JSON string. Because `maxFrameBytes` is 1,048,576 bytes, OMP aborts with `"RPC response exceeded the transport limit"`.
+- **Stale-fallback chain:** every successful discovery persists the pruned catalog to `~/.cache/omp-t3/models.json`. On live-discovery failure the shim serves, in order: in-memory cache → persisted catalog → builtin minimal list (first run only). Each fallback emits a stderr notice naming the stale source, sets `stale:true` on the RPC response, and resets automatically on the next successful discovery. The doctor's discovery-failure report still fires when nothing can serve.
 - In T3 Code's provider adapter (`status.ts` and `adapter.ts`):
   - Slug is built as `const slug = `${provider}/${id}`;`.
   - When starting a turn, T3 splits on the first slash: `const [provider, ...rest] = slug.split('/');`.
@@ -118,6 +135,15 @@ In T3's `packages/provider-pi/src/server/adapter.ts`:
   - Bash command approvals.
   - Interactive questions.
 - The translator forwards these frames cleanly between T3's client UI and OMP's tool harness.
+
+### 4.4 Contract Drift Watchdog (`src/doctor.js`)
+- Records last-known-good `{ompVersion, shimVersion}` to `~/.local/state/omp-t3/contract-state.json` on every cleanly settled turn.
+- Arms a 15s watchdog when OMP announces settlement (`prompt_result` with `agentInvoked:true && sessionSettled:true`); if `session_settled` never arrives, synthesizes it (turns never hang), prints a stderr banner naming the changed side + rollback command, and files a once-per-day GitHub issue on `hashangit/omp-t3` (via `gh`, else a prefilled URL).
+- Model-discovery failure (no cache) reports through the same path.
+
+### 4.5 Version Scheme
+- `package.json` version = `<pi-major>.<pi-minor>.<pi-patch>-<iteration>` (e.g. `1.3.0-1`). The first three segments track the upstream Pi release this iteration targets; the prerelease counter is the shim's own npm publish level (npm rejects literal 4-segment versions; prerelease sorts correctly: `1.3.0-9 < 1.3.0-10 < 1.4.0-1`).
+- `--version` prints the Pi base on line 1 (T3's gate parses the first semver token, requires >= 0.80.5) and the full identity on line 2. Package-derived, offline, instant.
 
 ---
 
@@ -157,3 +183,37 @@ Users configure T3 Code to use the translator via GUI Settings or `~/.t3/userdat
    - Verify `extension_ui_request` arrives in T3 Code UI and user confirmation passes back via `extension_ui_response`.
 6. **End-to-End T3 Run:**
    - Verified live in T3 Code UI with turns executing and settling cleanly.
+7. **Subagent Card Test:**
+   - Spawn a `task` subagent through the shim; verify T3 renders live subagent cards (status, model, progress text) and synthesized `tool_execution_update` frames arrive per child state change.
+8. **Contract Drift Test:**
+   - Feed a `prompt_result` with `sessionSettled:true` and withhold `session_settled`; verify the watchdog synthesizes `agent_settled`, prints rollback guidance, and rate-limits issue filing.
+
+---
+
+## 7. Documentation Maintenance & Drift Prevention
+
+This project's core risk is **silent protocol drift** on either side (T3 Code updates, OMP updates). Documentation is part of the contract, not commentary.
+
+### 7.1 Living documents vs historical records
+- **Living (must match the code at all times):** `README.md`, `planning_docs/omp-t3-translator-spec.md` (§3 matrix, §4 subsystems, §7 policy), `specs/001-omp-t3-translator/contracts/rpc-contract.md`, `specs/001-omp-t3-translator/contracts/cli-contract.md`, `specs/001-omp-t3-translator/data-model.md`.
+- **Historical (do not silently rewrite):** `specs/001-omp-t3-translator/spec.md`, `plan.md`, `tasks.md`, `research.md`. Amended only with clearly marked `**Superseded (drift fix):**` notes — never deleted.
+
+### 7.2 Same-PR rule
+Any change that adds, removes, renames, or reshapes a translated frame MUST, in the same PR:
+1. Update the §3 translation matrix (this document) and the interceptor matrices in `contracts/rpc-contract.md`.
+2. Update `data-model.md` frame entities and `TranslatorState` if state changed.
+3. Update `contracts/cli-contract.md` if CLI behavior or the version scheme changed.
+4. Add/adjust unit or e2e tests that pin the new frame shape (a frame shape without a test is a drift regressions waiting to happen).
+5. Bump the shim iteration (`<pi>-<iter+1>` in `package.json`).
+
+### 7.3 Runtime drift reporting
+- `src/doctor.js` is the enforcement arm: last-known-good bookkeeping, settle watchdog, discovery-failure reporting, rate-limited GitHub issues with rollback guidance.
+- Drift signatures (`settle-missing:<ompVersion>`, `discovery-failed:<ompVersion>:<reason>`) MUST stay stable — issue de-duplication depends on them.
+- When T3's adapter adds a consumed frame the shim does not translate, record it in §3 as an explicit, marked gap (`Decision: ignore/stub/own solution`) rather than leaving it undocumented.
+
+### 7.4 Version-bump checklist
+- [ ] Tests green (`npm test`)
+- [ ] `omp-t3 --check` passes
+- [ ] `--version` line 1 matches the targeted Pi base and satisfies T3's `MINIMUM_PI_VERSION`
+- [ ] §3 matrix + contracts docs reflect any frame changes (§7.2)
+- [ ] `npm publish` with the bumped iteration counter

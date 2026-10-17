@@ -78,7 +78,7 @@ It resolves fundamental protocol and operational mismatches without requiring fo
 **So that** I can inspect child subagent thoughts and tool outputs in real time.
 
 **Acceptance Criteria**:
-- **AC5.1**: OMP's subagent events (`task:subagent:event` and `subagent_event`) are captured and normalized to T3's subagent tool card conventions (`subagent`).
+- **AC5.1**: OMP's subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`, gated by `set_subagent_subscription`) are consumed and synthesized into T3's subagent tool card convention (`tool_execution_update` with `toolName:"subagent"` and `details.results[]` entries). OMP's `task` tool executions are renamed to `subagent` with `details.progress[]` merged into `details.results[]`. **Superseded (drift fix):** the original `task:subagent:event` normalization was dead code — OMP never emits that frame.
 - **AC5.2**: Tool calls specifying `task` are bridged with `subagent` identifier where expected by T3.
 
 ### US6: Usage & Token Metric Tracking (Priority: P3)
@@ -95,7 +95,7 @@ It resolves fundamental protocol and operational mismatches without requiring fo
 To guarantee that 95%+ of unchanged OMP/Pi functionality remains completely unaffected:
 
 1. **Invariant 1: Byte-Preserving Passthrough**  
-   Any line received on stdout that does not match an explicit interceptor (`session_settled`, `prompt_result`, `get_available_models`, `get_commands`, `task:subagent:event`) MUST be passed through directly to T3 Code's stdout as raw bytes, bypassing deserialization and serialization overhead.
+   Any line received on stdout that does not match an explicit interceptor (`session_settled`, `prompt_result`, `get_state` responses, `auto_compaction_*`, `subagent_lifecycle/progress/event`, `tool_execution_*` for the `task` tool, `get_available_models`, `get_commands`) MUST be passed through directly to T3 Code's stdout as raw bytes, bypassing deserialization and serialization overhead.
 2. **Invariant 2: CLI Argument Mirroring**  
    Only `--mode rpc` is rewritten to `--mode rpc-ui`. All other options, flags, and values are preserved in their original order.
 3. **Invariant 3: Signal & Exit Code Mirroring**  

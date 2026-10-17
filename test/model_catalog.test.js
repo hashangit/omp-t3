@@ -2,6 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { ModelCatalogManager } = require('../src/model_catalog.js');
 
 test('ModelCatalogManager prunes models safely and keeps required fields', () => {
@@ -44,7 +47,10 @@ test('ModelCatalogManager prunes models safely and keeps required fields', () =>
   assert.equal(m1.contextWindow, 1048576);
   assert.equal(m1.maxTokens, 131072);
   assert.equal(m1.reasoning, true);
-  assert.equal(m1.thinking, true);
+  assert.deepEqual(m1.thinkingLevelMap, {
+    off: null, minimal: null, low: 'low', medium: null, high: 'high', xhigh: null, max: 'max'
+  });
+  assert.equal(m1.thinking, undefined); // boolean form is ignored by T3; map emitted instead
   assert.equal(m1.cost, undefined); // pruned
   assert.equal(m1.pricingStatus, undefined); // pruned
 });
@@ -115,4 +121,51 @@ test('ModelCatalogManager intercepts get_available_models frame', () => {
   const parsed = JSON.parse(handled.response);
   assert.equal(parsed.id, 'test-req');
   assert.equal(parsed.models[0].name, 'GLM 5.3 Flash');
+});
+
+test('ModelCatalogManager persists discovered models and falls back to them on failure', () => {
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omp-t3-models-'));
+  const original = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = cacheDir;
+  try {
+    // 1. Successful discovery persists the pruned catalog
+    const manager = new ModelCatalogManager();
+    const fakeOmp = path.join(cacheDir, 'fake-omp');
+    fs.writeFileSync(fakeOmp, '#!/bin/sh\necho \'{"models":[{"provider":"zai","id":"glm-x","name":"GLM X","contextWindow":100,"thinking":["low","high"]}]}\'\n');
+    fs.chmodSync(fakeOmp, 0o755);
+    const models = manager.getModels(fakeOmp);
+    assert.equal(models.length, 1);
+    assert.equal(models[0].id, 'glm-x');
+    assert.equal(manager.servingStale, false);
+    const persisted = JSON.parse(fs.readFileSync(path.join(cacheDir, 'omp-t3', 'models.json'), 'utf8'));
+    assert.equal(persisted.models.length, 1);
+
+    // 2. Fresh manager (no memory), broken omp -> serves persisted list, flagged stale, stderr notice
+    const writes = [];
+    const origErr = process.stderr.write;
+    process.stderr.write = (c) => { writes.push(String(c)); return true; };
+    const manager2 = new ModelCatalogManager();
+    try {
+      const stale = manager2.getModels('/nonexistent/omp');
+      assert.equal(stale.length, 1);
+      assert.equal(stale[0].id, 'glm-x');
+      assert.equal(manager2.servingStale, true);
+      const resp = JSON.parse(manager2.createModelResponse('r1', '/nonexistent/omp'));
+      assert.equal(resp.stale, true);
+    } finally {
+      process.stderr.write = origErr;
+    }
+    assert.ok(writes.join('').includes('persisted catalog'), 'must tell the user the list is stale');
+
+    // 3. Nothing persisted anywhere -> static fallback + stderr notice (no crash)
+    process.env.XDG_CACHE_HOME = path.join(cacheDir, 'empty');
+    const manager3 = new ModelCatalogManager();
+    const fallback = manager3.getModels('/nonexistent/omp');
+    assert.ok(fallback.length >= 1);
+    assert.equal(manager3.servingStale, true);
+  } finally {
+    if (original === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = original;
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
 });
