@@ -19,14 +19,20 @@ class SettlementTracker {
     // the session again (prompt_result.sessionSettled === true). While
     // background jobs or detached subagents are pending, omp withholds
     // session_settled until that work drains - which can be minutes or
-    // never (long-lived dev servers). T3 finalizes a turn only on
-    // agent_settled, so the foreground turn must settle at the cycle
-    // boundary instead. Duplicated settles are safe: T3's settle probe is
-    // generation-guarded and idempotent.
+    // never (long-lived dev servers). The T3 run must MIRROR the omp
+    // session: it stays open across the pause, the wake cycle streams into
+    // it, and the translated session_settled finalizes it. agent_end is
+    // therefore never a settle point on its own - only an abort is (T3
+    // finalizes interrupted turns on agent_settled, and no session_settled
+    // follows an abort while work stays pending).
     this.cycleActive = false;
+    // True once an agent_start was observed for the current upstream turn.
+    // Gates the prompt_result fallback settle so turns that ran real cycles
+    // settle exactly once, from session_settled.
+    this.sawCycleThisTurn = false;
     this.settledThisCycle = false;
-    // True between an upstream abort command and the next agent_start, so the
-    // synthesized settle for the aborted cycle reports aborted:true.
+    // True between an upstream abort command and the settle synthesized for
+    // it, so the synthesized settle reports aborted:true.
     this.sawAbort = false;
   }
 
@@ -56,6 +62,7 @@ class SettlementTracker {
     }
     if (line.includes('"type":"prompt"') || line.includes('"type": "prompt"')) {
       this.lastPromptStatus = null;
+      this.sawCycleThisTurn = false;
     } else if (
       line.includes('"type":"abort"') ||
       line.includes('"type": "abort"') ||
@@ -64,6 +71,18 @@ class SettlementTracker {
     ) {
       this.lastPromptStatus = 'aborted';
       this.sawAbort = true;
+      // Idle abort: no agent cycle is open (background work pending, session
+      // paused), so no agent_end will follow to synthesize the settle from -
+      // and omp withholds session_settled while the work stays pending.
+      // Emit the terminal now so T3 finalizes the interrupted turn instead
+      // of waiting forever. omp keeps the pending work alive for the
+      // session; the later wake cycle is adopted as a continuation.
+      if (!this.cycleActive) {
+        this.settledThisCycle = true;
+        return {
+          emit: JSON.stringify({ type: 'agent_settled', aborted: true }) + '\n'
+        };
+      }
     }
     return null;
   }
@@ -150,26 +169,37 @@ class SettlementTracker {
       }
       if (parsed && parsed.type === 'agent_start') {
         this.cycleActive = true;
+        this.sawCycleThisTurn = true;
         this.settledThisCycle = false;
         this.sawAbort = false;
         return { handled: false };
       }
       if (parsed && parsed.type === 'agent_end' && this.cycleActive) {
-        // Foreground cycle finished. Settle the T3 turn here instead of
-        // waiting for session_settled: omp withholds it whenever background
-        // work is pending (prompt_result.sessionSettled:false), which left
-        // runs active forever. Forward agent_end untouched (byte-passthrough
-        // invariant), then append the synthesized terminal.
         this.cycleActive = false;
-        this.settledThisCycle = true;
-        const aborted = this.sawAbort || this.lastPromptStatus === 'aborted';
-        return {
-          handled: true,
-          suppress: false,
-          emit:
-            line + '\n' +
-            JSON.stringify({ type: 'agent_settled', aborted }) + '\n'
-        };
+        if (this.sawAbort) {
+          // The abort finalized this cycle: T3 finalizes interrupted turns
+          // on agent_settled, and no session_settled follows while pending
+          // work remains, so synthesize the terminal now. Forward agent_end
+          // untouched (byte-passthrough invariant), then append it.
+          // sawAbort only (never lastPromptStatus): the abort flag is set by
+          // this cycle's upstream abort frame and cleared by the next
+          // agent_start - lastPromptStatus belongs to the previous turn and
+          // must not turn a later wake cycle into a spurious aborted settle.
+          this.settledThisCycle = true;
+          return {
+            handled: true,
+            suppress: false,
+            emit:
+              line + '\n' +
+              JSON.stringify({ type: 'agent_settled', aborted: true }) + '\n'
+          };
+        }
+        // Normal cycle end. Do NOT settle here: while background work is
+        // pending, omp withholds session_settled and the wake cycle that
+        // delivers the results must stream into this still-active T3 run.
+        // The session_settled translation below is the single settle point
+        // once omp reports the session drained.
+        return { handled: false };
       }
       return { handled: false };
     }
@@ -206,6 +236,7 @@ class SettlementTracker {
     if (line.includes('"type":"prompt_result"') || line.includes('"type": "prompt_result"')) {
       let status = null;
       let agentInvoked = false;
+      let parsedSessionSettled;
       try {
         const parsed = JSON.parse(line);
         if (parsed.status) {
@@ -213,6 +244,7 @@ class SettlementTracker {
           status = parsed.status;
         }
         agentInvoked = parsed.agentInvoked === true;
+        parsedSessionSettled = parsed.sessionSettled;
       } catch {
         // Fallback simple regex if malformed
         if (line.includes('"aborted"')) {
@@ -221,11 +253,14 @@ class SettlementTracker {
           this.lastPromptStatus = status = 'completed';
         }
       }
-      // Fallback cycle settle when no agent_end was observed for this turn
-      // (e.g. the shim attached mid-turn): agentInvoked:true means an agent
-      // cycle ran, so settle now rather than waiting for a session_settled
-      // that omp may withhold while background work is pending.
-      if (agentInvoked && !this.settledThisCycle) {
+      // Fallback settle for turns whose agent frames were never observed
+      // (e.g. the shim attached mid-turn): without it the turn would hang
+      // until session_settled. Two gates keep it from settling a healthy
+      // run: (1) an agent cycle WAS observed (sawCycleThisTurn) - then
+      // session_settled owns the settle; (2) omp reports pending background
+      // work (sessionSettled:false) - then the run must stay active until
+      // the work drains and the wake cycle reports.
+      if (agentInvoked && !this.settledThisCycle && !this.sawCycleThisTurn && parsedSessionSettled !== false) {
         this.settledThisCycle = true;
         this.cycleActive = false;
         return {
@@ -253,8 +288,13 @@ class SettlementTracker {
       };
     }
     // Check for get_state responses: T3's settle probe finalizes a turn only
-    // when data.pendingMessageCount === 0. omp exposes the same signal as
-    // queuedMessageCount, so inject the alias T3 reads.
+    // when data.pendingMessageCount === 0 (and isStreaming/isCompacting are
+    // false). omp reports queued user messages as queuedMessageCount and
+    // background jobs / detached subagents as hasPendingAsyncWork - the two
+    // together are the truth about whether the session can still produce
+    // output, so the alias must carry both: while work is pending the probe
+    // keeps the T3 run open, and the drain -> wake -> session_settled
+    // sequence finalizes it with the results inside the same run.
     if (line.includes('"command":"get_state"') || line.includes('"command": "get_state"')) {
       try {
         const parsed = JSON.parse(line);
@@ -266,7 +306,8 @@ class SettlementTracker {
           typeof parsed.data.queuedMessageCount === 'number' &&
           parsed.data.pendingMessageCount === undefined
         ) {
-          parsed.data.pendingMessageCount = parsed.data.queuedMessageCount;
+          parsed.data.pendingMessageCount =
+            parsed.data.queuedMessageCount + (parsed.data.hasPendingAsyncWork === true ? 1 : 0);
           return { handled: true, emit: JSON.stringify(parsed) + '\n' };
         }
       } catch {

@@ -104,6 +104,18 @@ test('SettlementTracker injects pendingMessageCount alias into get_state respons
   const parsed = JSON.parse(res.emit);
   assert.equal(parsed.data.pendingMessageCount, 2);
   assert.equal(parsed.data.queuedMessageCount, 2);
+
+  // Pending background work (jobs/subagents) must hold T3's settle probe:
+  // pendingMessageCount counts queued messages PLUS pending async work.
+  const busy = tracker.handleDownstreamFrame('{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"queuedMessageCount":0,"hasPendingAsyncWork":true}}');
+  assert.equal(busy.handled, true);
+  const busyParsed = JSON.parse(busy.emit);
+  assert.equal(busyParsed.data.pendingMessageCount, 1);
+  assert.equal(busyParsed.data.hasPendingAsyncWork, true);
+
+  // Drained session reports 0 so the probe can finalize the run.
+  const drained = tracker.handleDownstreamFrame('{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"queuedMessageCount":0,"hasPendingAsyncWork":false}}');
+  assert.equal(JSON.parse(drained.emit).data.pendingMessageCount, 0);
   // Non-matching get_state responses pass through untouched
   const res2 = tracker.handleDownstreamFrame('{"type":"response","command":"get_state","success":false,"error":"x"}');
   assert.equal(res2.handled, false);
@@ -227,73 +239,56 @@ test('SettlementTracker leaves agent-invoked prompt responses untouched', () => 
   assert.equal(other.handled, false);
 });
 
-// --- Agent cycle settlement (background-pending turns) ---
+// --- Faithful session mirroring (background-pending turns) ---
 
-test('cycle settle: agent_end settles the turn when omp withholds session_settled (background work pending)', () => {
+test('mirror: agent_end with pending work does not settle; wake + session_settled does', () => {
   const tracker = new SettlementTracker();
 
-  tracker.handleUpstreamFrame('{"type": "prompt", "message": "run sleep 90"}');
+  tracker.handleUpstreamFrame('{"type": "prompt", "message": "run sleep 90 in background"}');
   const startRes = tracker.handleDownstreamFrame('{"type":"agent_start"}');
   assert.equal(startRes.handled, false); // passthrough untouched
 
-  const endLine = '{"type":"agent_end","isTerminal":false}';
-  const endRes = tracker.handleDownstreamFrame(endLine);
-  assert.equal(endRes.handled, true);
-  assert.equal(endRes.suppress, false);
-  const lines = endRes.emit.trim().split('\n');
-  assert.equal(lines.length, 2);
-  assert.deepEqual(JSON.parse(lines[0]), JSON.parse(endLine)); // agent_end forwarded untouched
-  const settled = JSON.parse(lines[1]);
-  assert.equal(settled.type, 'agent_settled');
-  assert.equal(settled.aborted, false);
+  // Foreground cycle ends while the background job still runs: the T3 run
+  // must stay open so the wake cycle can deliver the results into it.
+  const endRes = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
+  assert.equal(endRes.handled, false); // byte passthrough, no synthesis
 
-  // prompt_result with sessionSettled:false must not synthesize a duplicate
+  // omp announces the pause; nothing may settle the run here.
   const prRes = tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
   assert.equal(prRes.handled, true);
   assert.equal(prRes.suppress, true);
   assert.equal(prRes.emit, undefined);
+
+  // Drain: omp's wake cycle reports the results, then the session settles.
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  const wakeEnd = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
+  assert.equal(wakeEnd.handled, false); // wake end is still not a settle point
+
+  const ssRes = tracker.handleDownstreamFrame('{"type":"session_settled"}');
+  assert.equal(ssRes.handled, true);
+  assert.equal(ssRes.suppress, false);
+  const settled = JSON.parse(ssRes.emit.trim());
+  assert.equal(settled.type, 'agent_settled');
+  assert.equal(settled.aborted, false);
 });
 
-test('cycle settle: full normal cycle still emits translated session_settled after agent_end synthesis', () => {
+test('mirror: clean foreground turn settles exactly once, from session_settled', () => {
   const tracker = new SettlementTracker();
 
   tracker.handleUpstreamFrame('{"type": "prompt", "message": "hi"}');
   tracker.handleDownstreamFrame('{"type":"agent_start"}');
   const endRes = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":true}');
-  assert.equal(endRes.handled, true);
-  assert.ok(endRes.emit.includes('"agent_settled"'));
+  assert.equal(endRes.handled, false); // no cycle-boundary settle
 
   const prRes = tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":true}');
-  assert.equal(prRes.suppress, true); // prompt_result never reaches T3
+  assert.equal(prRes.suppress, true); // suppressed AND not a settle point (frames were seen)
+  assert.equal(prRes.emit, undefined);
 
-  // session_settled translation stays intact; T3 tolerates the duplicate
   const ssRes = tracker.handleDownstreamFrame('{"type":"session_settled"}');
-  assert.equal(ssRes.handled, true);
-  assert.equal(ssRes.suppress, false);
   assert.equal(JSON.parse(ssRes.emit.trim()).type, 'agent_settled');
 });
 
-test('cycle settle: steered and wake cycles each settle once (state resets on agent_start)', () => {
-  const tracker = new SettlementTracker();
-
-  tracker.handleUpstreamFrame('{"type": "prompt", "message": "work"}');
-  tracker.handleDownstreamFrame('{"type":"agent_start"}');
-  const first = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
-  assert.equal(first.emit.includes('"agent_settled"'), true);
-
-  // Steer cycle: omp emits no prompt_result for it
-  tracker.handleUpstreamFrame('{"type": "steer", "message": "done?"}');
-  tracker.handleDownstreamFrame('{"type":"agent_start"}');
-  const second = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
-  assert.equal(second.emit.includes('"agent_settled"'), true);
-
-  // Wake cycle
-  tracker.handleDownstreamFrame('{"type":"agent_start"}');
-  const third = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":true}');
-  assert.equal(third.emit.includes('"agent_settled"'), true);
-});
-
-test('cycle settle: upstream abort marks the synthesized settle aborted', () => {
+test('mirror: abort during an active cycle synthesizes the terminal at agent_end', () => {
   const tracker = new SettlementTracker();
 
   tracker.handleUpstreamFrame('{"type": "prompt", "message": "long work"}');
@@ -301,41 +296,78 @@ test('cycle settle: upstream abort marks the synthesized settle aborted', () => 
   tracker.handleUpstreamFrame('{"type": "abort"}');
   const endRes = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":true}');
   assert.equal(endRes.handled, true);
-  const settled = JSON.parse(endRes.emit.trim().split('\n')[1]);
+  const lines = endRes.emit.trim().split('\n');
+  assert.equal(lines.length, 2);
+  assert.deepEqual(JSON.parse(lines[0]), JSON.parse('{"type":"agent_end","isTerminal":true}')); // forwarded untouched
+  const settled = JSON.parse(lines[1]);
   assert.equal(settled.type, 'agent_settled');
   assert.equal(settled.aborted, true);
 
-  // The next cycle clears the abort flag
-  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  // The next turn clears the abort flag: a fresh cycle settles normally.
   tracker.handleUpstreamFrame('{"type": "prompt", "message": "retry"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
   const next = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":true}');
-  const nextSettled = JSON.parse(next.emit.trim().split('\n')[1]);
-  assert.equal(nextSettled.aborted, false);
+  assert.equal(next.handled, false); // no settle - awaits session_settled
 });
 
-test('cycle settle: prompt_result fallback settles when no agent frames were observed', () => {
+test('mirror: idle abort (paused run, no cycle) synthesizes the terminal immediately', () => {
   const tracker = new SettlementTracker();
 
+  tracker.handleUpstreamFrame('{"type": "prompt", "message": "start server"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
+  tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+
+  // Run is paused on the pending server; the user hits Stop. No cycle is
+  // open, so no agent_end will arrive - the settle must come at once.
+  const res = tracker.handleUpstreamFrame('{"type": "abort"}');
+  assert.ok(res, 'idle abort must synthesize a settle');
+  const settled = JSON.parse(res.emit.trim());
+  assert.equal(settled.type, 'agent_settled');
+  assert.equal(settled.aborted, true);
+});
+
+test('mirror: abort during an active cycle waits for agent_end (no idle synthesis)', () => {
+  const tracker = new SettlementTracker();
+
+  tracker.handleUpstreamFrame('{"type": "prompt", "message": "work"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  const res = tracker.handleUpstreamFrame('{"type": "abort"}');
+  assert.equal(res, null); // cycle open: agent_end owns the synthesis
+});
+
+test('mirror: prompt_result fallback settles only for mid-turn attach without pending work', () => {
+  const tracker = new SettlementTracker();
+
+  // Attached mid-turn, no agent frames seen, work drained: settle now.
   tracker.handleUpstreamFrame('{"type": "prompt", "message": "attached mid-turn"}');
-  const prRes = tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+  const prRes = tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":true}');
   assert.equal(prRes.handled, true);
   assert.equal(prRes.suppress, false);
   const settled = JSON.parse(prRes.emit.trim());
   assert.equal(settled.type, 'agent_settled');
   assert.equal(settled.aborted, false);
 
-  // session_settled translation still works afterwards
-  const ssRes = tracker.handleDownstreamFrame('{"type":"session_settled"}');
+  // Same shape but omp reports pending work: the run must stay open.
+  const tracker2 = new SettlementTracker();
+  tracker2.handleUpstreamFrame('{"type": "prompt", "message": "attached mid-turn, work pending"}');
+  const prRes2 = tracker2.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+  assert.equal(prRes2.handled, true);
+  assert.equal(prRes2.suppress, true);
+  assert.equal(prRes2.emit, undefined);
+
+  // ...and the later session_settled finalizes it.
+  const ssRes = tracker2.handleDownstreamFrame('{"type":"session_settled"}');
   assert.equal(JSON.parse(ssRes.emit.trim()).type, 'agent_settled');
 });
 
-test('cycle settle: agent_end without a prior agent_start passes through untouched', () => {
+test('mirror: agent_end without a prior agent_start passes through untouched', () => {
   const tracker = new SettlementTracker();
   const res = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":true}');
   assert.equal(res.handled, false);
 });
 
-test('cycle settle: subagent_event payload embedding agent_end must not settle the parent cycle', () => {
+test('mirror: subagent_event payload embedding agent_end must not close the parent cycle', () => {
   const tracker = new SettlementTracker();
 
   tracker.handleUpstreamFrame('{"type": "prompt", "message": "spawn"}');
@@ -344,8 +376,8 @@ test('cycle settle: subagent_event payload embedding agent_end must not settle t
   const res = tracker.handleDownstreamFrame(subEvent);
   assert.equal(res.handled, false); // owned by the subagent bridge
 
-  // The parent cycle is still open and settles on the real agent_end
+  // The parent cycle is still open: the real agent_end passes through
+  // without settling (session_settled remains the settle point).
   const endRes = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
-  assert.equal(endRes.handled, true);
-  assert.ok(endRes.emit.includes('"agent_settled"'));
+  assert.equal(endRes.handled, false);
 });
