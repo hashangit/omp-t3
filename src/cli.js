@@ -11,6 +11,20 @@ const pkg = require('../package.json');
  * @returns {{ action: string, ompArgs?: string[], options?: Record<string, any> }}
  */
 function parseArgs(argv) {
+  // Self-update subcommand (feature 002 US8). T3's provider maintenance calls
+  // `omp-t3 update --self`; per FR2 it must NEVER surface an unknown-option
+  // error, so this match runs first, the flags are conserved for the bin
+  // layer to interpret, and any other position cannot shadow it.
+  if (argv[0] === 'update') {
+    return {
+      action: 'update',
+      options: {
+        self: argv.includes('--self'),
+        yes: argv.includes('--yes')
+      }
+    };
+  }
+
   // Check for standalone helper flags
   if (argv.length === 1 || argv.length === 2) {
     if (argv.includes('--version') || argv.includes('-v')) {

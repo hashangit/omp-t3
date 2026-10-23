@@ -219,3 +219,84 @@ test('subagent state map is pruned when the task tool call ends', () => {
   bridge.handleDownstreamFrame('{"type":"tool_execution_end","toolCallId":"call_t","toolName":"task","result":{"content":[{"type":"text","text":"done"}]}}');
   assert.equal(bridge.subagentsByCall.has('call_t'), false, 'ended task call must not hold child state');
 });
+
+// --- Feature 002 FR6: narration projection ---
+
+function narrationForLastFrame(bridge, line) {
+  const res = bridge.handleDownstreamFrame(line);
+  return JSON.parse(res.line).partialResult.details.results[0];
+}
+
+test('narration: lastIntent wins over recentOutput while the child is running', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_t","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_t","id":"reader","index":0,"status":"running","agent":"reader"}}');
+
+  // recentOutput alone -> output tail is the text (unchanged legacy behavior)
+  const tail = narrationForLastFrame(bridge, '{"type":"subagent_progress","payload":{"parentToolCallId":"call_t","progress":{"id":"reader","index":0,"status":"running","recentOutput":"working on it"}}}');
+  assert.equal(tail.messages[0].content[0].text, 'working on it');
+
+  // omp 18.12.3+ adds lastIntent: it is the child's own step narration and
+  // must displace the raw output tail while the child runs.
+  const narration = narrationForLastFrame(bridge, '{"type":"subagent_progress","payload":{"parentToolCallId":"call_t","progress":{"id":"reader","index":0,"status":"running","lastIntent":"compacting the transcript","recentOutput":"working on it"}}}');
+  assert.equal(narration.messages[0].content[0].text, 'compacting the transcript');
+});
+
+test('narration: finished child shows the final assistant text over the running intent', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_t","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_t","id":"writer","index":0,"status":"running","agent":"writer"}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_progress","payload":{"parentToolCallId":"call_t","progress":{"id":"writer","index":0,"status":"running","lastIntent":"drafting the summary"}}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_event","payload":{"parentToolCallId":"call_t","id":"writer","event":{"type":"agent_message","message":{"role":"assistant","content":[{"type":"text","text":"Final answer text"}]}}}}');
+  const finished = JSON.parse(bridge.handleDownstreamFrame('{"type":"subagent_event","payload":{"parentToolCallId":"call_t","id":"writer","event":{"type":"agent_end"}}}').line)
+    .partialResult.details.results[0];
+  assert.equal(finished.finished, true);
+  assert.equal(finished.messages[0].content[0].text, 'Final answer text');
+});
+
+test('narration: task-result progress items project lastIntent into messages only when absent', () => {
+  const bridge = new SubagentBridge();
+  const res = bridge.handleDownstreamFrame(JSON.stringify({
+    type: 'tool_execution_end',
+    toolCallId: 'call_i',
+    toolName: 'task',
+    result: {
+      content: [],
+      details: {
+        results: [
+          { index: 0, id: 'A', agent: 'scout', status: 'completed', task: 'T1' },
+          { index: 1, id: 'B', agent: 'scout', status: 'running', task: 'T2', lastIntent: 'scanning deps' }
+        ]
+      }
+    }
+  }));
+  const [a, b] = JSON.parse(res.line).result.details.results;
+  assert.equal(a.messages, undefined, 'no lastIntent: entry shape unchanged');
+  assert.equal(b.messages[0].content[0].text, 'scanning deps');
+});
+
+// --- Feature 002 FR4: pending count for hold-open notices ---
+
+test('pendingCount counts unfinished children across open task calls', () => {
+  const bridge = new SubagentBridge();
+  assert.equal(bridge.pendingCount(), 0);
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c1","index":0,"status":"running"}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c2","index":1,"status":"running"}}');
+  // A second, later task call owns another live child
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_2","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_progress","payload":{"parentToolCallId":"call_2","progress":{"id":"c3","index":0,"status":"running"}}}');
+  assert.equal(bridge.pendingCount(), 3);
+
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c1","index":0,"status":"completed"}}');
+  assert.equal(bridge.pendingCount(), 2, 'finished children leave the count');
+});
+
+test('pendingCount returns 0 once the owning task call ends (count becomes non-authoritative)', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c1","index":0,"status":"running"}}');
+  assert.equal(bridge.pendingCount(), 1);
+  bridge.handleDownstreamFrame('{"type":"tool_execution_end","toolCallId":"call_1","toolName":"task","result":{"content":[]}}');
+  assert.equal(bridge.pendingCount(), 0, 'detached children are not counted: callers fall back to generic hold text');
+});

@@ -4,7 +4,7 @@
 const { parseArgs, resolveOmpPath, shimVersionInfo } = require('../src/cli.js');
 const { execSync } = require('node:child_process');
 const { spawnAndProxy } = require('../src/proxy.js');
-const { adaptT3ExtensionArgs } = require('../src/extension_compat.js');
+const { adaptT3ExtensionArgs, readDeferralLedger } = require('../src/extension_compat.js');
 const { setupSessionSymlink } = require('../src/symlink.js');
 const { ModelCatalogManager } = require('../src/model_catalog.js');
 const pkg = require('../package.json');
@@ -40,6 +40,8 @@ T3 Code Setup:
   4. Click Refresh to discover models and start chatting!
 
 Commands & Flags:
+  update [--self]    Self-update: reports the detected install channel and the
+                     exact update command; add --yes to actually run it
   --check            Verify omp installation, model discovery, and symlinks
   --setup-symlink    Create ~/.pi/agent/sessions symlink for T3 Usage Dashboard
   --version, -v      Show version information
@@ -49,6 +51,18 @@ All other flags (e.g. --session, --fork, --hide-thinking) are forwarded directly
 When --mode rpc is received from T3 Code, it is automatically rewritten to --mode rpc-ui.
 `);
     process.exit(0);
+    break;
+  }
+
+  case 'update': {
+    // Feature 002 US8/FR2: T3's provider maintenance invokes `update --self`
+    // routinely. The default is a successful no-op with manual guidance
+    // (exit 0, never an unknown-option error); `--yes` opts into running the
+    // detected package manager's update.
+    const { updateSelf } = require('../src/updater.js');
+    const result = updateSelf({ run: !!(parsed.options && parsed.options.yes) });
+    for (const line of result.lines) console.log(line);
+    process.exit(result.exitCode);
     break;
   }
 
@@ -94,6 +108,32 @@ When --mode rpc is received from T3 Code, it is automatically rewritten to --mod
       console.log(`[PASS] Usage Dashboard session bridge verified.`);
     } else {
       console.warn(`[WARN] Session bridge check: ${symRes.message}`);
+    }
+
+    // 4. Self-update channel (feature 002 US8): never an error — informational
+    const { detectInstallChannel } = require('../src/updater.js');
+    const channel = detectInstallChannel();
+    const channelCommand =
+      channel.channel === 'npm' ? 'npm update -g omp-t3'
+        : channel.channel === 'homebrew' ? 'brew upgrade hashangit/omp-t3/omp-t3'
+          : 'git pull && npm install (in the omp-t3 checkout)';
+    console.log(`[INFO] Self-update channel: ${channel.channel} (${channel.realpath}) — update with: ${channelCommand}`);
+
+    // 5. Extension deferral ledger (feature 002 FR12): proves omp deferred
+    //    this extension's startup (no first-message delay) after two
+    //    unchanged launches
+    {
+      const ledger = readDeferralLedger();
+      if (ledger.found && ledger.deferrable === true) {
+        const match = ledger.fingerprintMatches === null
+          ? 'fingerprint unchecked (compat copy not stat-able)'
+          : ledger.fingerprintMatches ? 'fingerprint matches current compat copy' : 'fingerprint is stale (omp re-evaluates on next launch)';
+        console.log(`[PASS] Extension deferral: deferred startup active (${match}).`);
+      } else if (ledger.found) {
+        console.warn(`[WARN] Extension deferral: ledger row exists but deferrable is false — omp loads it eagerly (first-message delay).`);
+      } else {
+        console.warn(`[WARN] Extension deferral: no ledger row yet (${ledger.error}) — run omp-t3 twice unchanged, then re-run --check.`);
+      }
     }
 
     console.log('--------------------------------------------');

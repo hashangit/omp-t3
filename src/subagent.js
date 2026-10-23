@@ -171,6 +171,10 @@ class SubagentBridge {
         entry.model = nested.resolvedModel;
       }
       if (nested.status === 'completed') entry.finished = true;
+      // Feature 002 FR6: omp's first-person step narration (18.12.3+).
+      if (typeof nested.lastIntent === 'string' && nested.lastIntent) {
+        entry._intent = nested.lastIntent;
+      }
       if (typeof nested.recentOutput === 'string' && nested.recentOutput) {
         entry._text = nested.recentOutput;
       }
@@ -187,8 +191,14 @@ class SubagentBridge {
       if (event.type === 'agent_end') entry.finished = true;
     }
 
-    // piSubagentOutput reads messages[] for progress/result text.
-    const messages = messagesFromText(entry._text);
+    // piSubagentOutput reads messages[] for progress/result text. Narration
+    // precedence (feature 002 FR6): while the child runs, its own step
+    // narration (`lastIntent`) wins; once finished, the latest assistant text
+    // wins; recentOutput is the output-tail fallback for both cases.
+    const narration = entry.finished
+      ? (entry._text ?? entry._intent)
+      : (entry._intent ?? entry._text);
+    const messages = messagesFromText(narration);
     if (messages) entry.messages = messages;
 
     const results = [...calls.entries()]
@@ -311,8 +321,32 @@ class SubagentBridge {
     if (typeof item.model === 'string' && entry.model === undefined) {
       entry.model = item.model;
     }
+    // Feature 002 FR6: project the child's current step narration into the
+    // card text T3 renders from messages[]. Only when absent: a finished
+    // entry's own result text must not be displaced by a progress snapshot.
+    if (typeof item.lastIntent === 'string' && item.lastIntent && entry.messages === undefined) {
+      entry.messages = messagesFromText(item.lastIntent);
+    }
 
     return entry;
+  }
+
+  /**
+   * Live unfinished subagent count across all open task calls (feature 002
+   * FR4). Authoritative only while the owning task tool call is still open:
+   * when omp ends the parent tool call, late children are forced finished and
+   * the per-call map is dropped, so callers must treat an empty count as "no
+   * authoritative count", not proof that no work is pending.
+   * @returns {number}
+   */
+  pendingCount() {
+    let count = 0;
+    for (const calls of this.subagentsByCall.values()) {
+      for (const entry of calls.values()) {
+        if (entry.finished !== true) count += 1;
+      }
+    }
+    return count;
   }
 }
 

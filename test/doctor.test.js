@@ -90,3 +90,65 @@ test('ContractDoctor reports drift with rollback guidance and rate-limits', () =
     assert.ok(Object.keys(doctor.state.issuesFiled).includes('settle-missing:18.12.0'));
   });
 });
+
+// --- Feature 002 FR5: in-thread drift notices ---
+
+test('watchdog writes the drift notice in-thread BEFORE the synthesized settle', async () => {
+  await withTempStateHome(async () => {
+    const doctor = new ContractDoctor({ ompPath: null, ompVersion: '18.11.3', watchdogMs: 20, issuesEnabled: false });
+    const out = [];
+    doctor.onNotice = (line) => out.push({ kind: 'notice', line });
+    doctor.onSynth = (line) => out.push({ kind: 'settle', line });
+    doctor.observeDownstream(JSON.stringify({ type: 'prompt_result', agentInvoked: true, sessionSettled: true, status: 'completed' }));
+    await new Promise((r) => setTimeout(r, 60));
+    doctor.stop();
+
+    assert.equal(out.length, 2);
+    assert.equal(out[0].kind, 'notice');
+    const frame = JSON.parse(out[0].line);
+    assert.equal(frame.type, 'extension_ui_request');
+    assert.equal(frame.method, 'notify');
+    assert.ok(frame.message.includes('session_settled'), 'notice names the drift');
+
+    assert.equal(out[1].kind, 'settle');
+    assert.equal(JSON.parse(out[1].line).type, 'agent_settled');
+  });
+});
+
+test('drift notice shares the 24h rate-limit ledger (option passes only from the watchdog)', () => {
+  withTempStateHome(() => {
+    const doctor = new ContractDoctor({ ompPath: null, ompVersion: '18.12.0', issuesEnabled: false });
+    const notices = [];
+    doctor.onNotice = (line) => notices.push(JSON.parse(line));
+
+    const writes = [];
+    const original = process.stderr.write;
+    process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
+    try {
+      const drift = { signature: 'settle-missing:18.12.0', side: 'omp', title: 'session_settled vanished', detail: 'D', sample: {} };
+      doctor.report(drift, { notify: true });
+      assert.equal(notices.length, 1);
+      assert.equal(notices[0].method, 'notify');
+      assert.equal(notices[0].notifyType, 'info');
+      assert.ok(notices[0].message.includes('session_settled vanished'));
+      assert.equal(writes.length, 1, 'the stderr rollback guidance still prints');
+
+      // Same signature within 24h: stderr still logs, no second in-thread notice
+      doctor.report(drift, { notify: true });
+      assert.equal(notices.length, 1);
+      assert.equal(writes.length, 2);
+    } finally {
+      process.stderr.write = original;
+    }
+  });
+});
+
+test('discovery-failure reports never emit in-thread notices', () => {
+  withTempStateHome(() => {
+    const doctor = new ContractDoctor({ ompPath: null, ompVersion: '18.12.0', issuesEnabled: false });
+    const notices = [];
+    doctor.onNotice = (line) => notices.push(line);
+    doctor.reportDiscoveryFailure(new Error('omp models --json exited 1'));
+    assert.equal(notices.length, 0, 'no active turn exists during discovery: consumer renders nothing');
+  });
+});

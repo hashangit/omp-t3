@@ -29,6 +29,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 
 const T3_EXTENSION_BASENAME = 'pi-t3-mcp-extension.ts';
 
@@ -48,6 +49,92 @@ const GET_COMMANDS_REPLACEMENT = [
 
 function defaultCachePath() {
   return path.join(os.homedir(), '.cache', 'omp-t3', 'pi-t3-mcp-extension.compat.ts');
+}
+
+/** OMP's local agent state lives here (the shim runs children with ~/.omp/agent). */
+function defaultAgentDbPath() {
+  return path.join(os.homedir(), '.omp', 'agent', 'agent.db');
+}
+
+/** Ledger key omp records startup-safety under: extension_startup:v1:<path>. */
+function deferralLedgerKey(extensionPath) {
+  return `extension_startup:v1:${extensionPath}`;
+}
+
+/**
+ * Reads omp's deferred-extension ledger row for the adapted compat copy
+ * (feature 002 US8/FR12 --check verification).
+ *
+ * omp writes, into its local agent.db `cache` table, a row per extension it
+ * has evaluated for deferred startup: value is
+ * `{ fingerprint: "<bytes>:<mtimeMs>", deferrable: <bool> }`. After two
+ * consecutive launches with an unchanged file the row exists with
+ * `deferrable: true` — the proof that deferred loading is active and the
+ * extension's tool registration is not delaying the first message.
+ *
+ * Best-effort by design: any failure (node:sqlite unavailable, db missing,
+ * row absent) is reported as data, never thrown — `--check` degrades to WARN,
+ * the proxy path never calls this.
+ * @param {{ extensionPath?: string, agentDbPath?: string }} [options]
+ * @returns {{
+ *   extensionPath: string, dbPath: string,
+ *   found: boolean, deferrable: boolean|null,
+ *   fingerprint: string|null, fingerprintMatches: boolean|null,
+ *   error: string|null
+ * }}
+ */
+function readDeferralLedger(options = {}) {
+  const extensionPath = options.extensionPath || defaultCachePath();
+  const dbPath = options.agentDbPath || defaultAgentDbPath();
+  const result = {
+    extensionPath,
+    dbPath,
+    found: false,
+    deferrable: null,
+    fingerprint: null,
+    fingerprintMatches: null,
+    error: null
+  };
+
+  if (!fs.existsSync(dbPath)) {
+    result.error = `ledger db not found at ${dbPath} (first omp launch pending?)`;
+    return result;
+  }
+
+  try {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db.prepare('SELECT value FROM cache WHERE key = ?').get(deferralLedgerKey(extensionPath));
+      if (row && typeof row.value === 'string') {
+        result.found = true;
+        try {
+          const parsed = JSON.parse(row.value);
+          result.deferrable = parsed.deferrable === true;
+          result.fingerprint = typeof parsed.fingerprint === 'string' ? parsed.fingerprint : null;
+        } catch {
+          result.error = 'ledger value is not valid JSON';
+        }
+      }
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    result.error = `cannot read ledger: ${err.message}`;
+    return result;
+  }
+
+  // Compare against the current compat copy (informational: a mismatch after
+  // a T3 refresh just means omp re-evaluates on next launch).
+  if (result.fingerprint) {
+    try {
+      const stat = fs.statSync(extensionPath);
+      const [bytes, mtimeMs] = result.fingerprint.split(':').map(Number);
+      result.fingerprintMatches = stat.size === bytes && Math.abs(stat.mtimeMs - mtimeMs) <= 1;
+    } catch {
+      result.fingerprintMatches = null;
+    }
+  }
+  return result;
 }
 
 /**
@@ -124,6 +211,9 @@ async function adaptT3ExtensionArgs(ompArgs, options = {}) {
 
 module.exports = {
   adaptT3ExtensionArgs,
+  defaultAgentDbPath,
+  deferralLedgerKey,
+  readDeferralLedger,
   T3_EXTENSION_BASENAME,
   GET_COMMANDS_MARKER,
   GET_COMMANDS_REPLACEMENT

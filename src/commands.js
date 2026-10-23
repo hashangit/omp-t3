@@ -41,7 +41,12 @@ class CommandBridge {
   constructor(options = {}) {
     this.commands = null; // last raw OMP catalog (array of command entries)
     this.pendingRefresh = null; // { reqId, timer, deliver }
-    this.refreshTimeoutMs = options.refreshTimeoutMs ?? 2500;
+    // Feature 002 US6 / FR8: omp pushes its catalog right after ready on a
+    // cold start, but on slow machines the binary's own startup (npm CLIs,
+    // extension copies) can exceed a 2.5s bound. T3 renders an empty `/` menu
+    // and never re-polls within the turn, so the wait bound trades a 2.5s
+    // worst case for correctness. The push usually resolves this in <1s.
+    this.refreshTimeoutMs = options.refreshTimeoutMs ?? 10_000;
     this.seq = 0;
   }
 

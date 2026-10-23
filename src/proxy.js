@@ -5,6 +5,7 @@ const { spawn } = require('node:child_process');
 const path = require('node:path');
 const os = require('node:os');
 const { SettlementTracker } = require('./settlement.js');
+const { HoldOpenTracker } = require('./notices.js');
 const { ModelCatalogManager } = require('./model_catalog.js');
 const { SubagentBridge } = require('./subagent.js');
 const { CommandBridge } = require('./commands.js');
@@ -36,6 +37,13 @@ function createProxyPipeline(options) {
   let rlChild = null;
   let subagentSubscriptionSent = false;
   doctor.onSynth = (line) => clientOut.write(line);
+  doctor.onNotice = (line) => clientOut.write(line);
+  // Feature 002 FR4: hold-open notices. The tracker writes notify frames to
+  // the consumer while the run is kept open for pending async work; the
+  // subagent bridge supplies the only count the bridge can state honestly.
+  const holdOpen = new HoldOpenTracker((line) => clientOut.write(line));
+  settlementTracker.pendingSubagents = () => subagentBridge.pendingCount();
+  settlementTracker.onHoldOpen = (info) => holdOpen.tick(info);
   function start() {
     rlClient = readline.createInterface({
       input: clientIn,
@@ -134,7 +142,11 @@ function createProxyPipeline(options) {
       if (settleResult.handled) {
         if (!settleResult.suppress && settleResult.emit) {
           clientOut.write(settleResult.emit);
-          if (settleResult.emit.includes('"agent_settled"')) doctor.noteSettled();
+          if (settleResult.emit.includes('"agent_settled"')) {
+            doctor.noteSettled();
+            // The run finalized: the next hold interval starts fresh.
+            holdOpen.clear();
+          }
         }
         return;
       }

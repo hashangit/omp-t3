@@ -381,3 +381,92 @@ test('mirror: subagent_event payload embedding agent_end must not close the pare
   const endRes = tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
   assert.equal(endRes.handled, false);
 });
+
+// --- Hold-open notices (feature 002 FR4) ---
+
+test('hold-open: prompt_result with sessionSettled:false fires the hold observer, settle timing unchanged', () => {
+  const tracker = new SettlementTracker();
+  const holds = [];
+  tracker.onHoldOpen = (info) => holds.push(info);
+
+  tracker.handleUpstreamFrame('{"type":"prompt","message":"run sleep 90 &"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
+  const prRes = tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+  assert.equal(prRes.emit, undefined, 'hold observability must not alter settle suppression');
+  assert.equal(holds.length, 1);
+  assert.equal(holds[0].pendingSubagents, 0, 'no supplier wired: count 0');
+  assert.equal(holds[0].countAuthoritative, false);
+
+  // Prompt completes without withholding: no hold signal
+  const tracker2 = new SettlementTracker();
+  tracker2.handleUpstreamFrame('{"type":"prompt","message":"hi"}');
+  tracker2.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":true}');
+  assert.equal(tracker2.onHoldOpen, null);
+});
+
+test('hold-open: subagent count is authoritative only when the supplier reports live children', () => {
+  const tracker = new SettlementTracker();
+  const holds = [];
+  tracker.onHoldOpen = (info) => holds.push(info);
+  tracker.pendingSubagents = () => 2;
+
+  tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+  assert.equal(holds.length, 1);
+  assert.deepEqual(holds[0], { pendingSubagents: 2, countAuthoritative: true });
+});
+
+test('hold-open: get_state probe with pending async work also refreshes the hold', () => {
+  const tracker = new SettlementTracker();
+  const holds = [];
+  tracker.onHoldOpen = (info) => holds.push(info);
+
+  tracker.handleDownstreamFrame('{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"queuedMessageCount":0,"hasPendingAsyncWork":true}}');
+  assert.equal(holds.length, 1);
+  assert.equal(JSON.stringify(holds[0].pendingSubagents), '0');
+
+  // Drained probe: no hold signal
+  tracker.handleDownstreamFrame('{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"queuedMessageCount":0,"hasPendingAsyncWork":false}}');
+  assert.equal(holds.length, 1);
+});
+
+test('hold-open: agentInvoked:false prompt_result never signals a hold', () => {
+  const tracker = new SettlementTracker();
+  const holds = [];
+  tracker.onHoldOpen = (info) => holds.push(info);
+  tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":false,"sessionSettled":false}');
+  assert.equal(holds.length, 0);
+});
+
+// --- Feature 002 FR10 pin ---
+
+test('FR10 pin: compaction after a settled run neither re-settles, re-opens, nor kills the run', () => {
+  const tracker = new SettlementTracker();
+
+  // A background-pending run that settled via session_settled
+  tracker.handleUpstreamFrame('{"type":"prompt","message":"run in background"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
+  tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+  const settled = tracker.handleDownstreamFrame('{"type":"session_settled"}');
+  assert.equal(JSON.parse(settled.emit.trim()).type, 'agent_settled');
+
+  // omp later auto-compacts in the background (real post-settle timing)
+  const start = tracker.handleDownstreamFrame('{"type":"auto_compaction_start"}');
+  assert.equal(start.handled, true);
+  const end = tracker.handleDownstreamFrame('{"type":"auto_compaction_end","result":{"summary":"post-settle","tokensBefore":3000},"aborted":false,"willRetry":false}');
+  assert.equal(end.handled, true);
+  const types = end.emit.split('\n').filter(Boolean).map((l) => JSON.parse(l).type);
+  assert.deepEqual(types, ['compaction_start', 'compaction_end'], 'pair still passes through');
+  assert.ok(!end.emit.includes('"agent_settled"'), 'no synthesized settle from compaction');
+
+  // The tracker is not re-opened or poisoned: the next turn still settles
+  // exactly once, from session_settled.
+  tracker.handleUpstreamFrame('{"type":"prompt","message":"next"}');
+  tracker.handleDownstreamFrame('{"type":"agent_start"}');
+  tracker.handleDownstreamFrame('{"type":"agent_end","isTerminal":false}');
+  const pr = tracker.handleDownstreamFrame('{"type":"prompt_result","status":"completed","agentInvoked":true,"sessionSettled":false}');
+  assert.equal(pr.emit, undefined);
+  const second = tracker.handleDownstreamFrame('{"type":"session_settled"}');
+  assert.equal(JSON.parse(second.emit.trim()).type, 'agent_settled');
+});
