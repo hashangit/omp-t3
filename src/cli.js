@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
 const pkg = require('../package.json');
@@ -68,10 +69,56 @@ function parseArgs(argv) {
     rewritten.unshift('--mode', 'rpc-ui');
   }
 
+  // Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS). Without the env
+  // var this pushes nothing — the spawned argv stays byte-identical.
+  rewritten.push(...subagentCapArgs(process.env.OMPT3_MAX_SUBAGENTS));
+
   return {
     action: 'proxy',
     ompArgs: rewritten
   };
+}
+
+/**
+ * Cache path for the shim-managed subagent-concurrency overlay
+ * (same XDG pattern as the model catalog cache).
+ */
+function subagentOverlayPath() {
+  const cacheDir = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+  return path.join(cacheDir, 'omp-t3', 'subagent-limits.yml');
+}
+
+/**
+ * Builds the extra omp argv for the opt-in subagent concurrency cap.
+ *
+ * omp natively enforces `task.maxConcurrency` — its task-tool semaphore
+ * queues excess spawns until a slot frees — and derives the
+ * "Max N concurrent subagents; excess queue." line of its own system
+ * prompt from the same setting (live-verified against omp 18.12.3: an
+ * overlay with maxConcurrency 2 made the model quote that exact line).
+ * One repeatable `--config` overlay therefore both enforces the cap and
+ * tells the lead agent about it; subagents are in-process tasks sharing
+ * omp's single V8 heap, so bounding live children bounds the peak that
+ * OOM-killed long fan-out sessions.
+ *
+ * Returns [] unless `rawValue` is a positive integer — every default
+ * launch (and every invalid value, warned about on stderr) injects
+ * nothing. `--config` is repeatable in omp, so this never collides with
+ * user-passed overlays.
+ * @param {string|undefined} rawValue process.env.OMPT3_MAX_SUBAGENTS
+ * @returns {string[]} argv items to append ('--config', <path>)
+ */
+function subagentCapArgs(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') return [];
+  const max = Number(rawValue);
+  if (!Number.isInteger(max) || max < 1) {
+    console.error(`[omp-t3] Ignoring OMPT3_MAX_SUBAGENTS='${rawValue}': expected a positive integer.`);
+    return [];
+  }
+  const overlayPath = subagentOverlayPath();
+  fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
+  fs.writeFileSync(overlayPath, `task:\n  maxConcurrency: ${max}\n`);
+  return ['--config', overlayPath];
 }
 
 /**
@@ -132,5 +179,7 @@ function shimVersionInfo(version = pkg.version) {
 module.exports = {
   parseArgs,
   resolveOmpPath,
-  shimVersionInfo
+  shimVersionInfo,
+  subagentOverlayPath,
+  subagentCapArgs
 };

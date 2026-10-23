@@ -67,3 +67,56 @@ test('FR1 pin: --session and --fork launch arguments forward byte-identically', 
   const separate = parseArgs(['--session=/tmp/x.jsonl']);
   assert.ok(separate.ompArgs.includes('--session=/tmp/x.jsonl'), 'no rewrite of the value path');
 });
+
+// --- Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS) ---
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { subagentOverlayPath, subagentCapArgs } = require('../src/cli.js');
+
+/** Runs fn with a temp XDG_CACHE_HOME and OMPT3_MAX_SUBAGENTS set/restored. */
+function withCapEnv(rawValue, fn) {
+  const prevCache = process.env.XDG_CACHE_HOME;
+  const prevCap = process.env.OMPT3_MAX_SUBAGENTS;
+  process.env.XDG_CACHE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'ompt3-cap-'));
+  if (rawValue === undefined) delete process.env.OMPT3_MAX_SUBAGENTS;
+  else process.env.OMPT3_MAX_SUBAGENTS = rawValue;
+  try {
+    return fn();
+  } finally {
+    if (prevCache === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prevCache;
+    if (prevCap === undefined) delete process.env.OMPT3_MAX_SUBAGENTS;
+    else process.env.OMPT3_MAX_SUBAGENTS = prevCap;
+  }
+}
+
+test('subagentCapArgs: no env var injects nothing (default launch stays byte-identical)', () => {
+  assert.deepEqual(withCapEnv(undefined, () => subagentCapArgs(undefined)), []);
+  assert.deepEqual(withCapEnv(undefined, () => subagentCapArgs('')), []);
+  const argv = withCapEnv(undefined, () => parseArgs(['--mode', 'rpc', '--session', 'abc']).ompArgs);
+  assert.deepEqual(argv, ['--mode', 'rpc-ui', '--session', 'abc']);
+});
+
+test('subagentCapArgs: valid value writes the task.maxConcurrency overlay and injects --config', () => {
+  withCapEnv('2', () => {
+    const args = subagentCapArgs('2');
+    const overlayPath = subagentOverlayPath();
+    assert.deepEqual(args, ['--config', overlayPath]);
+    assert.equal(fs.readFileSync(overlayPath, 'utf8'), 'task:\n  maxConcurrency: 2\n');
+    // End-to-end through the launch translator: T3's `--mode rpc` spawn
+    // carries the injected overlay after the mode rewrite.
+    const argv = parseArgs(['--mode', 'rpc']).ompArgs;
+    assert.deepEqual(argv, ['--mode', 'rpc-ui', '--config', overlayPath]);
+  });
+});
+
+test('subagentCapArgs: invalid values warn and inject nothing', () => {
+  // Number() semantics: '1e3' → 1000 is a legal positive integer, so the
+  // rejected set is non-integers, zero, negatives, and garbage.
+  for (const bad of ['0', '-3', '2.5', 'abc']) {
+    const args = withCapEnv(bad, () => subagentCapArgs(bad));
+    assert.deepEqual(args, [], `'${bad}' must inject nothing`);
+  }
+});

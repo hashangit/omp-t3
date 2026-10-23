@@ -47,6 +47,12 @@ Commands & Flags:
   --version, -v      Show version information
   --help, -h         Show this help message
 
+Environment:
+  OMPT3_MAX_SUBAGENTS=<N>  Cap concurrent subagents at N: the shim injects
+                           omp's task.maxConcurrency overlay (excess spawns
+                           queue; the lead agent is told the limit). Unset or
+                           invalid = no change to the launch.
+
 All other flags (e.g. --session, --fork, --hide-thinking) are forwarded directly to omp.
 When --mode rpc is received from T3 Code, it is automatically rewritten to --mode rpc-ui.
 `);

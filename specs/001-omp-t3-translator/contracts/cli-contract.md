@@ -34,6 +34,9 @@ Helper flags handled locally without launching a persistent RPC daemon:
 - `omp-t3 --setup-symlink`: Creates symlink `~/.pi/agent/sessions` -> `~/.omp/agent/sessions` for historical usage dashboard discovery.
 - `omp-t3 --check`: Verifies `omp` binary in PATH, runs test model extraction, and validates compatibility.
 
+### Scheme D: Opt-in subagent concurrency cap (`OMPT3_MAX_SUBAGENTS`)
+When the environment variable holds a positive integer N, the shim writes `~/.cache/omp-t3/subagent-limits.yml` (`task:\n  maxConcurrency: N`) and appends `--config <that file>` to the spawned argv — the only argv rewrite besides `--mode`. omp enforces `task.maxConcurrency` in its task-tool semaphore (excess spawns queue) and reports the limit in its own system prompt, so both enforcement and model communication are omp-native. `--config` is repeatable, so user-passed overlays are unaffected. Without the variable — or with an invalid value, which is warned about on stderr — the spawned argv is unchanged, preserving the byte-parity invariant for every default launch. (Live-verified against omp 18.12.3: with the overlay, the model quotes "Max 2 concurrent subagents; excess queue.")
+
 ---
 
 ## 2. Version Scheme
