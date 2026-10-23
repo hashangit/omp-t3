@@ -23,6 +23,29 @@
  * text T3's piSubagentOutput reads for progress/result display) and `model`.
  * The raw subagent_* frames are suppressed: T3's adapter ignores unknown
  * event types, so forwarding them is pure noise.
+ *
+ * Stop + reconciliation alignment (T3's own adapters stop a subagent's
+ * children when the parent run is interrupted; omp exposes the same levers
+ * over RPC). T3's Pi adapter finalizes a run on `agent_settled` without
+ * sweeping open subagent rows, and drops every later frame — so children
+ * still marked running when the run dies stay "running" forever (T3 DB
+ * zombies). Two bridge mechanisms close that gap:
+ *
+ * - `abortSweep()`: called synchronously when T3 interrupts (upstream
+ *   `abort`/`abort_and_prompt`), BEFORE any settle synthesis reaches T3.
+ *   Terminalizes every tracked unfinished entry (`stopReason:"aborted"` →
+ *   T3 status `interrupted`) and returns `cancel_subagent` requests so omp
+ *   actually hard-kills detached children instead of running them on
+ *   invisibly.
+ * - `refreshRequest()`/`mergeSnapshots()`: periodic `get_subagents`
+ *   reconciliation (single-flight, rate-limited). omp's snapshot is the
+ *   authoritative live child list — it heals missed spawn/lifecycle events
+ *   and keeps names, mandates, and narration current. Snapshots never
+ *   un-finish an entry: events stay authoritative for terminal states.
+ *
+ * Bridge-injected RPC ids live in the `ompt3-sub-` namespace; their
+ * responses are consumed here and suppressed (T3's adapter would ignore
+ * them, but the wire stays clean).
  */
 const SUBAGENT_EVENT_TYPES = new Set(['subagent_lifecycle', 'subagent_progress', 'subagent_event']);
 
@@ -43,6 +66,15 @@ class SubagentBridge {
     // subagent" forever.
     this.taskCalls = new Set();
     this.activeTaskCall = null;
+    // Bridge-injected RPC state (ompt3-sub- id namespace): sequence counter
+    // plus single-flight/rate-limit state for get_subagents reconciliation.
+    this.seq = 0;
+    this.refreshPending = false;
+    this.lastRefreshAt = 0;
+    this.refreshMinIntervalMs = 1000;
+    // Transient flag: handleDownstreamFrame sets it when a NEW task tool
+    // call starts; the proxy reads it to trigger get_subagents refresh.
+    this.newTaskCallStarted = false;
   }
 
   /**
@@ -73,8 +105,10 @@ class SubagentBridge {
     const invoked = parsed.toolName === 'task' || parsed.tool === 'task' || parsed.name === 'task';
 
     if (parsed.type === 'tool_execution_start' && invoked && parsed.toolCallId) {
+      const isNew = !this.taskCalls.has(parsed.toolCallId);
       this.taskCalls.add(parsed.toolCallId);
       this.activeTaskCall = parsed.toolCallId;
+      if (isNew) this.newTaskCallStarted = true;
     }
 
     if (!invoked) return { handled: false };
@@ -101,7 +135,13 @@ class SubagentBridge {
 
     if (this.normalizeTaskRecords(parsed.result)) modified = true;
     if (this.normalizeTaskRecords(parsed.partialResult)) modified = true;
-    return { handled: true, line: modified ? JSON.stringify(parsed) + '\n' : line + '\n' };
+    const taskStarted = this.newTaskCallStarted;
+    this.newTaskCallStarted = false;
+    return {
+      handled: true,
+      line: modified ? JSON.stringify(parsed) + '\n' : line + '\n',
+      ...(taskStarted ? { taskStarted: true } : {})
+    };
   }
 
   /**
@@ -117,10 +157,7 @@ class SubagentBridge {
     // otherwise spawn a second, never-terminating T3 node under that tool.
     // If no task call was ever seen (e.g. the shim attached mid-turn), anchor
     // to the explicit parent rather than dropping the card entirely.
-    const explicit = typeof payload.parentToolCallId === 'string' ? payload.parentToolCallId : null;
-    const callId = explicit && this.taskCalls.has(explicit)
-      ? explicit
-      : this.activeTaskCall ?? (this.taskCalls.size === 0 ? explicit : null);
+    const callId = this.resolveCallId(typeof payload.parentToolCallId === 'string' ? payload.parentToolCallId : null);
     if (!callId) return { handled: true }; // suppress: nothing to attach to
 
     let calls = this.subagentsByCall.get(callId);
@@ -152,14 +189,13 @@ class SubagentBridge {
     if (parsed.type === 'subagent_lifecycle') {
       const name = typeof nested.agent === 'string' && nested.agent ? nested.agent : payload.agent;
       if (typeof name === 'string' && name) entry.agent = name !== 'task' ? name : id;
-      const desc = typeof nested.task === 'string' && nested.task ? nested.task : payload.task;
-      if (typeof desc === 'string' && desc) entry.task = desc;
-      if (payload.status === 'completed') {
-        entry.finished = true;
-      } else if (payload.status === 'aborted') {
-        entry.finished = true;
-        entry.stopReason = 'aborted';
-      }
+      // SubagentLifecyclePayload carries the mandate as `description`
+      // (no `task` field); progress frames carry it as `task`.
+      const desc = typeof nested.task === 'string' && nested.task ? nested.task
+        : typeof payload.task === 'string' && payload.task ? payload.task
+          : typeof payload.description === 'string' && payload.description ? payload.description : null;
+      if (desc) entry.task = desc;
+      this.applyStatus(entry, payload.status);
     } else if (parsed.type === 'subagent_progress') {
       const name = typeof nested.agent === 'string' && nested.agent ? nested.agent : payload.agent;
       if (typeof name === 'string' && name) entry.agent = name !== 'task' ? name : id;
@@ -170,7 +206,7 @@ class SubagentBridge {
       } else if (typeof nested.resolvedModel === 'string' && nested.resolvedModel) {
         entry.model = nested.resolvedModel;
       }
-      if (nested.status === 'completed') entry.finished = true;
+      this.applyStatus(entry, nested.status);
       // Feature 002 FR6: omp's first-person step narration (18.12.3+).
       if (typeof nested.lastIntent === 'string' && nested.lastIntent) {
         entry._intent = nested.lastIntent;
@@ -201,11 +237,58 @@ class SubagentBridge {
     const messages = messagesFromText(narration);
     if (messages) entry.messages = messages;
 
+    return { handled: true, line: this.synthesizeUpdate(callId, calls) };
+  }
+
+  /**
+   * Resolves which `task` tool call owns a child frame/snapshot. Trusts
+ * omp's explicit parent only when it is a known task call; late events
+ * fired during a later tool (wait, bash) must not steal ownership. With no
+ * task call ever seen (shim attached mid-run), anchors to the explicit
+ * parent rather than dropping the card entirely.
+   * @param {string|null} explicit
+   * @returns {string|null}
+   */
+  resolveCallId(explicit) {
+    if (explicit && this.taskCalls.has(explicit)) return explicit;
+    if (this.activeTaskCall) return this.activeTaskCall;
+    return this.taskCalls.size === 0 ? explicit : null;
+  }
+
+  /**
+   * Maps an OMP SubagentStatus/SubagentLifecycleStatus onto a tracked
+   * entry. Terminal states stick: an entry is never un-finished, because a
+   * terminal lifecycle event is stronger evidence than any later snapshot.
+   * @param {{ finished?: boolean }} entry
+   * @param {unknown} status
+   */
+  applyStatus(entry, status) {
+    if (typeof status !== 'string' || entry.finished === true) return;
+    if (status === 'completed' || status === 'done' || status === 'success') {
+      entry.finished = true;
+    } else if (status === 'aborted') {
+      entry.finished = true;
+      entry.stopReason = 'aborted';
+    } else if (status === 'failed' || status === 'error') {
+      entry.finished = true;
+      entry.stopReason = 'error';
+      if (entry.exitCode === undefined) entry.exitCode = 1;
+    }
+  }
+
+  /**
+   * Serializes the tracked children of one task call into the synthesized
+   * `tool_execution_update` frame T3's emitSubagentTasks consumes.
+   * @param {string} callId
+   * @param {Map<string, object>} calls
+   * @returns {string}
+   */
+  synthesizeUpdate(callId, calls) {
     const results = [...calls.entries()]
       .sort((a, b) => (a[1].step ?? 0) - (b[1].step ?? 0))
-      .map(([, e]) => {
+      .map(([childId, e]) => {
         const out = {};
-        out.agent = e.agent ?? id;
+        out.agent = e.agent ?? childId;
         out.task = e.task ?? '';
         if (e.step !== undefined) out.step = e.step;
         out.finished = e.finished;
@@ -215,14 +298,174 @@ class SubagentBridge {
         if (e.messages !== undefined) out.messages = e.messages;
         return out;
       });
-
-    const synthesized = JSON.stringify({
+    return JSON.stringify({
       type: 'tool_execution_update',
       toolCallId: callId,
       toolName: 'subagent',
       partialResult: { content: [], details: { results } }
     }) + '\n';
-    return { handled: true, line: synthesized };
+  }
+
+  /**
+   * Terminalizes every tracked unfinished subagent and returns both wire
+   * outputs for the interrupt path: synthesized updates for T3 (entries
+   * `finished:true, stopReason:"aborted"` -> T3 status `interrupted`, so
+   * interrupting a run can never leave subagent rows "running" forever) and
+   * one `cancel_subagent` request per live child so omp hard-kills the
+   * detached ones instead of running them on invisibly. Mirrors T3's own
+   * adapters, which propagate a parent-run interrupt down to the children.
+   * Called synchronously on the upstream abort line, BEFORE any settle
+   * synthesis is written to T3 (after `agent_settled` the Pi adapter drops
+   * every frame - turns are finalized without sweeping open subagent rows).
+   * @returns {{ toClient: string[], toOmp: string[] }}
+   */
+  abortSweep() {
+    const toClient = [];
+    const toOmp = [];
+    for (const [callId, calls] of this.subagentsByCall) {
+      let touched = false;
+      for (const [childId, entry] of calls) {
+        if (entry.finished === true) continue;
+        entry.finished = true;
+        if (entry.stopReason === undefined) entry.stopReason = 'aborted';
+        touched = true;
+        toOmp.push(JSON.stringify({
+          id: `ompt3-sub-${++this.seq}`,
+          type: 'cancel_subagent',
+          subagentId: childId
+        }) + '\n');
+      }
+      if (touched) toClient.push(this.synthesizeUpdate(callId, calls));
+    }
+    return { toClient, toOmp };
+  }
+
+  /**
+   * Single-flight, rate-limited `get_subagents` request line. omp's
+   * snapshot is the authoritative live child list; reconciling against it
+   * heals missed spawn/lifecycle events and keeps card details current.
+   * @returns {string|null} JSONL line to write to omp, or null
+   */
+  refreshRequest() {
+    const now = Date.now();
+    if (this.refreshPending) return null;
+    if (now - this.lastRefreshAt < this.refreshMinIntervalMs) return null;
+    this.refreshPending = true;
+    this.lastRefreshAt = now;
+    return JSON.stringify({ id: `ompt3-sub-${++this.seq}`, type: 'get_subagents' }) + '\n';
+  }
+
+  /**
+   * Handles responses to bridge-injected subagent RPC (`ompt3-sub-*`).
+   * All are suppressed from T3; `get_subagents` responses additionally
+   * reconcile the tracked entries from omp's authoritative snapshot.
+   * @param {unknown} parsed
+   * @returns {{ handled: boolean, emit?: string }}
+   */
+  handleBridgeResponse(parsed) {
+    if (!parsed || typeof parsed !== 'object') return { handled: false };
+    if (parsed.type !== 'response') return { handled: false };
+    if (typeof parsed.id !== 'string' || !parsed.id.startsWith('ompt3-sub-')) return { handled: false };
+    if (parsed.command === 'get_subagents') {
+      this.refreshPending = false;
+      if (parsed.success === true && parsed.data && Array.isArray(parsed.data.subagents)) {
+        return { handled: true, emit: this.mergeSnapshots(parsed.data.subagents) };
+      }
+      return { handled: true };
+    }
+    // cancel_subagent (and any future bridge-only command): suppress.
+    return { handled: true };
+  }
+
+  /**
+   * Merges omp `get_subagents` snapshots into the tracked per-call maps.
+   * Snapshots enrich (agent name, mandate, model, narration) and can
+   * surface children the event stream never delivered; they never
+   * un-finish an entry (events are authoritative for terminal states) and
+   * terminal children are absent from snapshots by construction.
+   * @param {Array<unknown>} subagents
+   * @returns {string|undefined} synthesized update lines (joined) or none
+   */
+  mergeSnapshots(subagents) {
+    const changedCalls = new Map();
+    for (const snap of subagents) {
+      if (!snap || typeof snap !== 'object') continue;
+      const childId = typeof snap.id === 'string' && snap.id ? snap.id : null;
+      if (!childId) continue;
+      const callId = this.resolveCallId(
+        typeof snap.parentToolCallId === 'string' ? snap.parentToolCallId : null
+      );
+      if (!callId) continue;
+      let calls = this.subagentsByCall.get(callId);
+      if (!calls) {
+        calls = new Map();
+        this.subagentsByCall.set(callId, calls);
+      }
+      let entry = calls.get(childId);
+      if (!entry) {
+        entry = {
+          agent: undefined,
+          task: '',
+          step: typeof snap.index === 'number' ? snap.index : undefined,
+          finished: false
+        };
+        calls.set(childId, entry);
+        changedCalls.set(callId, calls);
+      }
+      // New entries still take name/mandate/model/narration from the
+      // snapshot; the change flag only gates re-emission for known ones.
+      if (this.applySnapshot(entry, snap, childId)) changedCalls.set(callId, calls);
+    }
+    if (changedCalls.size === 0) return undefined;
+    let out = '';
+    for (const [callId, calls] of changedCalls) out += this.synthesizeUpdate(callId, calls);
+    return out || undefined;
+  }
+
+  /**
+   * Applies one snapshot record to a tracked entry; returns true when any
+   * rendered field changed (gates re-emission).
+   * @param {object} entry
+   * @param {Record<string, unknown>} snap
+   * @param {string} childId
+   * @returns {boolean}
+   */
+  applySnapshot(entry, snap, childId) {
+    let changed = false;
+    const name = typeof snap.agent === 'string' && snap.agent ? snap.agent : null;
+    const agent = name && name !== 'task' ? name : childId;
+    if (entry.agent !== agent) {
+      entry.agent = agent;
+      changed = true;
+    }
+    const desc = [snap.task, snap.description, snap.assignment]
+      .find((t) => typeof t === 'string' && t);
+    if (typeof desc === 'string' && desc && entry.task !== desc) {
+      entry.task = desc;
+      changed = true;
+    }
+    const progress = snap.progress && typeof snap.progress === 'object' ? snap.progress : {};
+    const model = typeof progress.resolvedModelIdentity === 'string' && progress.resolvedModelIdentity
+      ? progress.resolvedModelIdentity
+      : typeof progress.resolvedModel === 'string' && progress.resolvedModel
+        ? progress.resolvedModel : null;
+    if (model && entry.model !== model) {
+      entry.model = model;
+      changed = true;
+    }
+    if (typeof progress.lastIntent === 'string' && progress.lastIntent) entry._intent = progress.lastIntent;
+    if (typeof progress.recentOutput === 'string' && progress.recentOutput) entry._text = progress.recentOutput;
+    this.applyStatus(entry, snap.status);
+    // Narration precedence identical to the event path (feature 002 FR6).
+    const narration = entry.finished
+      ? (entry._text ?? entry._intent)
+      : (entry._intent ?? entry._text);
+    const messages = messagesFromText(narration);
+    if (JSON.stringify(entry.messages) !== JSON.stringify(messages)) {
+      if (messages) entry.messages = messages;
+      changed = true;
+    }
+    return changed;
   }
 
   /**

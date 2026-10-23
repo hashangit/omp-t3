@@ -470,3 +470,28 @@ test('FR10 pin: compaction after a settled run neither re-settles, re-opens, nor
   const second = tracker.handleDownstreamFrame('{"type":"session_settled"}');
   assert.equal(JSON.parse(second.emit.trim()).type, 'agent_settled');
 });
+
+test('onAbort fires on upstream abort before the idle settle synthesis is returned', () => {
+  const tracker = new SettlementTracker();
+  const order = [];
+  tracker.onAbort = () => order.push('abort-sweep');
+  tracker.onHoldOpen = () => order.push('hold');
+
+  const result = tracker.handleUpstreamFrame('{"type": "abort"}');
+  assert.deepEqual(order, ['abort-sweep'], 'exactly one sweep per abort, nothing else fires');
+  assert.ok(result && result.emit, 'idle abort still synthesizes the terminal');
+  assert.equal(JSON.parse(result.emit).type, 'agent_settled',
+    'the sweep has already run by the time the terminal is handed back');
+
+  // Non-abort frames never trigger the sweep.
+  tracker.handleUpstreamFrame('{"type": "prompt", "message": "x"}');
+  assert.equal(order.length, 1);
+});
+
+test('onAbort fires once per abort_and_prompt as well', () => {
+  const tracker = new SettlementTracker();
+  let sweeps = 0;
+  tracker.onAbort = () => { sweeps += 1; };
+  tracker.handleUpstreamFrame('{"type": "abort_and_prompt", "message": "redo"}');
+  assert.equal(sweeps, 1);
+});

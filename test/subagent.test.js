@@ -300,3 +300,141 @@ test('pendingCount returns 0 once the owning task call ends (count becomes non-a
   bridge.handleDownstreamFrame('{"type":"tool_execution_end","toolCallId":"call_1","toolName":"task","result":{"content":[]}}');
   assert.equal(bridge.pendingCount(), 0, 'detached children are not counted: callers fall back to generic hold text');
 });
+
+test('abortSweep terminalizes unfinished children and returns cancel requests for both sides', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c1","index":0,"status":"running","agent":"scout"}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c2","index":1,"status":"completed","agent":"reviewer"}}');
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_2","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_progress","payload":{"parentToolCallId":"call_2","progress":{"id":"c3","index":0,"status":"running"}}}');
+
+  const sweep = bridge.abortSweep();
+
+  // T3 side: one synthesized update per call with live children. Completed
+  // entries keep their own terminal state; live ones become interrupted
+  // (finished + stopReason aborted -> T3 status `interrupted`).
+  assert.equal(sweep.toClient.length, 2);
+  const first = JSON.parse(sweep.toClient[0]);
+  assert.equal(first.type, 'tool_execution_update');
+  assert.equal(first.toolCallId, 'call_1');
+  const byAgent = new Map(first.partialResult.details.results.map((r) => [r.agent, r]));
+  assert.equal(byAgent.get('scout').finished, true);
+  assert.equal(byAgent.get('scout').stopReason, 'aborted');
+  assert.equal(byAgent.get('reviewer').stopReason, undefined, 'already-completed entry is not relabeled');
+
+  // omp side: hard-kill only the still-live children.
+  const cancels = sweep.toOmp.map((l) => JSON.parse(l));
+  assert.deepEqual(cancels.map((c) => c.subagentId).sort(), ['c1', 'c3']);
+  for (const c of cancels) {
+    assert.equal(c.type, 'cancel_subagent');
+    assert.ok(c.id.startsWith('ompt3-sub-'), 'bridge-injected ids live in the ompt3-sub- namespace');
+  }
+
+  assert.equal(bridge.pendingCount(), 0, 'nothing stays pending after the sweep');
+  assert.deepEqual(bridge.abortSweep(), { toClient: [], toOmp: [] }, 'second sweep is a no-op');
+});
+
+test('subagent_lifecycle failed status maps to a T3 failed entry', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
+  const res = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c1","index":0,"status":"failed","agent":"redteam","description":"Adversarial review"}}');
+  const parsed = JSON.parse(res.line);
+  const entry = parsed.partialResult.details.results[0];
+  assert.equal(entry.agent, 'redteam');
+  assert.equal(entry.task, 'Adversarial review', 'lifecycle mandates arrive as description, not task');
+  assert.equal(entry.finished, true);
+  assert.equal(entry.stopReason, 'error');
+  assert.equal(entry.exitCode, 1);
+});
+
+test('get_subagents snapshot heals a missed spawn and is suppressed from T3', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_9","toolName":"task","args":{}}');
+
+  const req = bridge.refreshRequest();
+  assert.ok(req, 'first refresh request is issued');
+  const reqFrame = JSON.parse(req);
+  assert.equal(reqFrame.type, 'get_subagents');
+  assert.ok(reqFrame.id.startsWith('ompt3-sub-'));
+  assert.equal(bridge.refreshRequest(), null, 'single-flight while a refresh is pending');
+  assert.equal(bridge.refreshRequest(), null, '...and rate-limited right after');
+
+  const res = bridge.handleBridgeResponse(JSON.parse(JSON.stringify({
+    type: 'response',
+    id: reqFrame.id,
+    command: 'get_subagents',
+    success: true,
+    data: {
+      subagents: [
+        {
+          id: 'ghost',
+          index: 0,
+          agent: 'security-reviewer',
+          status: 'running',
+          task: 'Audit the bridge',
+          parentToolCallId: 'call_9',
+          progress: { resolvedModelIdentity: 'zai/glm-5.3', lastIntent: 'Reading src/proxy.js' }
+        }
+      ]
+    }
+  })));
+  assert.equal(res.handled, true, 'bridge-injected responses never reach T3');
+  const update = JSON.parse(res.emit.trim());
+  assert.equal(update.type, 'tool_execution_update');
+  assert.equal(update.toolCallId, 'call_9');
+  const entry = update.partialResult.details.results[0];
+  assert.equal(entry.agent, 'security-reviewer');
+  assert.equal(entry.task, 'Audit the bridge');
+  assert.equal(entry.model, 'zai/glm-5.3');
+  assert.equal(entry.finished, false);
+  assert.equal(entry.messages[0].content[0].text, 'Reading src/proxy.js');
+
+  // Identical snapshot: no re-emission.
+  const again = bridge.handleBridgeResponse(JSON.parse(JSON.stringify({
+    type: 'response',
+    id: 'ompt3-sub-2',
+    command: 'get_subagents',
+    success: true,
+    data: { subagents: [{ id: 'ghost', index: 0, agent: 'security-reviewer', status: 'running', task: 'Audit the bridge', parentToolCallId: 'call_9', progress: { resolvedModelIdentity: 'zai/glm-5.3', lastIntent: 'Reading src/proxy.js' } }] }
+  })));
+  assert.equal(again.handled, true);
+  assert.equal(again.emit, undefined, 'unchanged snapshots do not churn the wire');
+});
+
+test('snapshot never un-finishes an entry terminalized by an event', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"c1","index":0,"status":"aborted","agent":"scout"}}');
+  const res = bridge.handleBridgeResponse(JSON.parse(JSON.stringify({
+    type: 'response',
+    id: 'ompt3-sub-1',
+    command: 'get_subagents',
+    success: true,
+    data: { subagents: [{ id: 'c1', index: 0, agent: 'scout', status: 'running', parentToolCallId: 'call_1' }] }
+  })));
+  assert.equal(res.emit, undefined, 'no update when only weaker evidence exists');
+  const sweep = bridge.abortSweep();
+  assert.equal(sweep.toOmp.length, 0, 'terminalized children are not re-cancelled');
+});
+
+test('cancel_subagent responses are consumed and suppressed', () => {
+  const bridge = new SubagentBridge();
+  const res = bridge.handleBridgeResponse(JSON.parse(JSON.stringify({
+    type: 'response',
+    id: 'ompt3-sub-7',
+    command: 'cancel_subagent',
+    success: true,
+    data: { cancelled: true }
+  })));
+  assert.equal(res.handled, true);
+  assert.equal(res.emit, undefined);
+
+  const foreign = bridge.handleBridgeResponse(JSON.parse(JSON.stringify({
+    type: 'response',
+    id: 'req-42',
+    command: 'cancel_subagent',
+    success: true
+  })));
+  assert.equal(foreign.handled, false, 'T3-originated responses are none of our business');
+});

@@ -43,7 +43,27 @@ function createProxyPipeline(options) {
   // subagent bridge supplies the only count the bridge can state honestly.
   const holdOpen = new HoldOpenTracker((line) => clientOut.write(line));
   settlementTracker.pendingSubagents = () => subagentBridge.pendingCount();
-  settlementTracker.onHoldOpen = (info) => holdOpen.tick(info);
+  settlementTracker.onHoldOpen = (info) => {
+    holdOpen.tick(info);
+    // Settlement is withheld for pending work: also reconcile the live
+    // child list so the hold-open count and card details stay truthful.
+    requestSubagentRefresh();
+  };
+  // Interrupt translation: terminalize tracked subagents for T3 and
+  // hard-cancel omp-side children BEFORE the settle synthesis runs - after
+  // agent_settled T3's Pi adapter drops every frame, so this is the only
+  // window in which the cards can reach their terminal state.
+  settlementTracker.onAbort = () => {
+    const sweep = subagentBridge.abortSweep();
+    for (const line of sweep.toClient) clientOut.write(line);
+    for (const line of sweep.toOmp) childIn.write(line);
+  };
+  // Reconciliation against omp's authoritative live child list
+  // (get_subagents): heals missed events and refreshes card details.
+  const requestSubagentRefresh = () => {
+    const line = subagentBridge.refreshRequest();
+    if (line) childIn.write(line);
+  };
   function start() {
     rlClient = readline.createInterface({
       input: clientIn,
@@ -133,6 +153,16 @@ function createProxyPipeline(options) {
         childIn.write(JSON.stringify({ type: 'set_subagent_subscription', level: 'events' }) + '\n');
       }
 
+      // 0.2 The subscription confirmation means omp's subagent event bus is
+      //     now live: reconcile once against the authoritative snapshot so
+      //     children spawned before the subscription are not invisible.
+      if (
+        trimmed.includes('"command":"set_subagent_subscription"') ||
+        trimmed.includes('"command": "set_subagent_subscription"')
+      ) {
+        requestSubagentRefresh();
+      }
+
       // 0.5 Contract doctor: arms the settle watchdog on OMP's settlement
       //     announcement, clears it on session_settled.
       doctor.observeDownstream(trimmed);
@@ -161,12 +191,28 @@ function createProxyPipeline(options) {
         return;
       }
 
-      // 3. Check subagent bridge
+      // 3. Check subagent bridge (subagent_* events, task tool rename, and
+      //    responses to bridge-injected ompt3-sub-* RPC)
+      if (trimmed.includes('ompt3-sub-')) {
+        try {
+          const bridgeResp = subagentBridge.handleBridgeResponse(JSON.parse(trimmed));
+          if (bridgeResp.handled) {
+            if (bridgeResp.emit) clientOut.write(bridgeResp.emit);
+            return;
+          }
+        } catch {
+          // Malformed: fall through to the normal subagent path.
+        }
+      }
       const subResult = subagentBridge.handleDownstreamFrame(trimmed);
       if (subResult.handled && subResult.line) {
         clientOut.write(subResult.line);
+        // A new task tool call opened: reconcile against omp's snapshot so
+        // card details (names, mandates, models) survive missed events.
+        if (subResult.taskStarted) requestSubagentRefresh();
         return;
       }
+      if (subResult.handled) return; // raw subagent_* frames stay suppressed
 
       // 4. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
       clientOut.write(line + '\n');

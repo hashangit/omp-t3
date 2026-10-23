@@ -40,6 +40,12 @@ class SettlementTracker {
     // use (tests) stays silent.
     this.onHoldOpen = null;
     this.pendingSubagents = null;
+    // Interrupt observer: fired synchronously inside the upstream abort
+    // branch, BEFORE any settle synthesis is returned to the proxy. The
+    // proxy uses it to terminalize tracked subagents for T3 and to cancel
+    // omp-side children while the T3 turn is still active (after
+    // agent_settled the Pi adapter drops every frame).
+    this.onAbort = null;
   }
 
   /**
@@ -94,6 +100,10 @@ class SettlementTracker {
     ) {
       this.lastPromptStatus = 'aborted';
       this.sawAbort = true;
+      // Subagent stop translation must land while T3's turn is still
+      // active: the hook writes terminal subagent updates to T3 and
+      // cancel_subagent requests to omp before the settle below.
+      if (typeof this.onAbort === 'function') this.onAbort();
       // Idle abort: no agent cycle is open (background work pending, session
       // paused), so no agent_end will follow to synthesize the settle from -
       // and omp withholds session_settled while the work stays pending.
