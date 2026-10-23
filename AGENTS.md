@@ -12,6 +12,6 @@ Edit the canonical copies in `.agents/skills/` only — every agent-specific dir
 - Work orders are `specs/<spec>/tasks.md`; every `[x]` claim must be true at the seal, with a `verify:` line per task.
 - Review receipts are written to `Reviews/`.
 - Reviewer switches: Red Team, Code Reviewer, Security Reviewer, Scrutinizer, Repo Auditor, Ponytail Reviewer, Architect — all **Enabled**.
-- Release is **not wired yet**: this repo has no tag-triggered `.github/workflows` release workflow, and the bundled publisher expects plain `X.Y.Z` semver while this package uses prerelease versions such as `1.3.0-6`. Leave `RELEASE_CI_WORKFLOW` unresolved and report `BLOCKED` rather than cutting a release until the owner explicitly requests that setup.
+- **Release (wired 2026-10-23)**: `.github/workflows/release.yml` triggers on `vX.Y.Z` tags (plain semver only — the prerelease `1.3.0-N` scheme ended with 1.3.0-6; 1.4.0 onward is plain `X.Y.Z`). The workflow runs the gates on the tagged source, requires a `Reviews/*-gatekeeper-RELEASE.md` PASS receipt sealed to the release commit's parent, and creates the GitHub Release from the committed `RELEASE_NOTES-vX.Y.Z.md`. npm publishing and the Homebrew tap (`hashangit/homebrew-omp-t3`, formula pulls the npm tarball) stay manual steps performed by the owner. The gate on a clean, committed HEAD still precedes any push, bump, or tag.
 
 See `.agents/skills/gatekeeper/SKILL.md` for the router and its `references/setup.md` for configuration rules.
