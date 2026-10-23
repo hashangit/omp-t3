@@ -2,7 +2,7 @@
 
 **Feature**: `002-bridge-ux-parity`
 **Branch**: `feat/bridge-ux-parity`
-**Status**: Landed 2026-10-23 — rounds 2–4 in the working tree (suite 153/153 green, incl. the seven review-gap fixes below); live bridge verification recorded (quickstart §10.1–§10.2); T3 UI/DB verification and Gatekeeper still owed (see §10.2 scope note)
+**Status**: Complete — spec closed and merged to main (2026-10-23). Suite 153/153; live bridge/omp verification in quickstart §10.1–§10.2. Owed, recorded honestly: T3 adapter/UI/DB verification on the final tree, and the independent Gatekeeper review of the committed candidate. Upstream limits: FR18 finalized zombies, US1 clickable sessions.
 **Created**: 2026-10-23 (speckit specify → plan → tasks pipeline; setup scripts absent from `.specify/`, paths resolved from `.specify/feature.json`)
 
 Completed tasks carry a `verify:` line per the repo's Gatekeeper rule — every `[x]` claim must be reproducible at the seal.
