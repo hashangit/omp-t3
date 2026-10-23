@@ -44,6 +44,15 @@ R1 verdict: the consumer reads only `agent, task, step, finished, stopReason, ex
 - Task-tool `progress[]` items project `lastIntent` into `messages[]` only when the entry lacks any (no displacement of result text).
 - Bounds unchanged (progress ≤ 200 chars rendered, final ≤ 10 000).
 
+### SubagentEntry — attribution, registry & lifecycle (rounds 3–4, review-hardened)
+
+- **SubagentChildRegistry** (internal, never serialized): `childId → { ownerCallId: string|null, step: number|null, live: boolean, status }`. The registry is the superset of the per-call maps: every observed child is registered at first sighting, attributed or not.
+- Ownership is resolved at first attach under the unambiguous-attribution rule (FR14): explicit known task-call parent → already-attributed child (its recorded owner) → only task call ever seen → explicit parent when no task-call history; anything else is ambiguous. An open task call alone never attributes an unknown child (the late-orphan case: parent's call ended, later call open).
+- Ambiguous updates create **no card entry**: rendering is withheld and reconciliation (`get_subagents`) is requested — but the child is still registered with `ownerCallId: null` and its observed status, so the interrupt sweep cancels it (FR19). The authoritative snapshot re-attributes on arrival (FR17).
+- The bridge tracks the **open-task-call set** (start adds, end removes) alongside the full task-call history; the old `activeTaskCall` (last-started-wins) semantics are replaced (round 4).
+- **Stable step** (FR15): assigned once at first attributed attach — the child's own index when unique among the parent's current children, else the next free integer; frozen afterwards. Duplicate/missing indices and event/snapshot disagreement cannot mint a second node (the consumer keys nodes `parent:subagent:step`).
+- On interrupt, every unfinished attributed entry is forced terminal (`aborted`) before any settle synthesis, and one cancellation per **live registry entry** (attributed or withheld) is sent upstream (FR16/FR19); snapshots never un-finish (events stay authoritative for terminals).
+
 ### TranslatorState additions
 
 | Field | Purpose |

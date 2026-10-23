@@ -55,17 +55,55 @@ On an upstream `abort`/`abort_and_prompt`, `SettlementTracker.onAbort` fires **s
 
 `SubagentBridge.abortSweep()` returns:
 
-- **toClient**: one `tool_execution_update` per open task call that had live children — every entry `finished:true, stopReason:"aborted"` (T3 maps to `interrupted`). Entries already terminal keep their own state.
+- **toClient**: one `tool_execution_update` per owning task call with unfinished entries — open **or already ended** (the detached-children shape: omp ends the parent's task calls while the children keep running; late child events re-attach entries under the ended call, and the sweep must close them in T3 while the turn is still active. Live-verified 2026-10-23: an interrupt 14s after the parent's calls ended, with six children detached — without the ended-call update the re-attached entries' last T3-visible state stays `running` into the finalize). Every entry `finished:true, stopReason:"aborted"` (T3 maps to `interrupted`). Entries already terminal keep their own state.
 - **toOmp**: one `{"id":"ompt3-sub-<n>","type":"cancel_subagent","subagentId":<id>}` per live child, written before the forwarded `abort` — omp hard-kills detached children (`data.cancelled:boolean`; `false` when not running, so racing synchronous children are harmless). Verified live against omp 18.12.6.
 
-No tracked children → both lists empty → zero wire change (bare aborts behave exactly as before, pinned by the pre-existing abort tests).
+No observed children — per-call maps and the live-child registry both empty — means both lists stay empty → zero wire change (bare aborts behave exactly as before, pinned by the pre-existing abort tests). Withheld (unattributed) children contribute cancellations only: no owning call exists, so there is no card update for them (§5.3, FR19).
 
 ### 5.2 Reconciliation (omp → T3 details)
 
 omp's `get_subagents` response (`data.subagents[]`, `SubagentSnapshot[]`) is the authoritative live child list. The bridge requests it (single-flight, ≥1s rate limit, `ompt3-sub-` id) when:
 
 1. the `set_subagent_subscription` response arrives (subscription live — seed children spawned before it),
-2. a **new** `task` tool call starts (`taskStarted` flag on the subagent bridge result),
-3. each hold-open tick fires (settlement withheld for pending work).
+  * a **new** `task` tool call starts (`taskStarted` flag on the subagent bridge result),
+  * each hold-open tick fires (settlement withheld for pending work).
 
-Snapshots merge by `id` under the same parent-attribution rules as events (explicit `parentToolCallId` only when it is a known task call; else `activeTaskCall`; else the explicit parent when no task call was ever seen). They enrich `agent`, `task`, `model` (`progress.resolvedModelIdentity` → `resolvedModel`), and narration (`progress.lastIntent`/`recentOutput` under the FR6 precedence), surface children the event stream never delivered, and never un-finish entries. Unchanged snapshots re-emit nothing. All `ompt3-sub-*` responses are consumed and suppressed — never forwarded to T3.
+Snapshots merge by `id` under the attribution rule in §5.3. They enrich `agent`, `task`, `model` (`progress.resolvedModelIdentity` → `resolvedModel`), and narration (`progress.lastIntent`/`recentOutput` under the FR6 precedence), surface children the event stream never delivered, and never un-finish an entry. Unchanged snapshots re-emit nothing. All `ompt3-sub-*` responses are consumed and suppressed — never forwarded to T3. Terminal state also survives per-call map pruning: an entry deleted when its task call ended is re-attached from the registry's recorded outcome (`finished`/`stopReason`/`exitCode`) — a late running snapshot restores the child terminal instead of resurrecting it as running (round-4 follow-up; same for entries terminalized by the sweep).
+
+### 5.3 Attribution rule (round 4 — target state; US9/FR14–FR15/FR19, review-hardened)
+
+Both event frames and snapshots resolve the owning task call by the same ordered rule:
+
+1. explicit `parentToolCallId` that is a **known task call** (open or ended — a late completion arriving during a later `wait`/`bash` lands on its true parent) — **unless it conflicts with rule 2's recorded owner**;
+2. else a **child id the bridge has already attributed** → its recorded owner (registry-first: once a child has an owner, later parentless frames follow the child, not the call timeline). **Ownership is not renegotiated**: a known explicit parent that CONTRADICTS the recorded owner resolves to nothing — the update is withheld (no second card under the other parent), the recorded owner stands, and reconciliation is requested;
+3. else the **only task call ever seen** in the session (single-call runs, open or ended — the pinned parentless-frame behavior);
+4. else, when **no task call was ever seen**, the explicit parent (mid-turn attach);
+5. otherwise the update is **ambiguous** — more than one task call exists in the session's history and the child is unknown with no usable explicit parent. **An open task call alone is never proof of ownership**: the late orphan (parent A's call ended, call B open, A's unknown child reports parentless) lands under no call.
+
+Ambiguous updates are **withheld from rendering** (no card is minted) and a reconciliation refresh is requested; the authoritative snapshot then attributes the child from stronger evidence (snapshots carry explicit parents), or the child stays unrendered. Withheld children are not invisible to the lifecycle: every observed child id — attributed or not — is recorded in the **live-child registry** with its observed status, and the interrupt sweep (§5.1) cancels every live registry entry by id (FR19). Scope of the guarantee: misattributed *rendering* is structurally impossible — a child the bridge cannot attribute is unrendered, never misrendered, and still cancelled.
+
+**Canonical outcome across channels** (round-4 follow-up): the registry record is the single source of truth for a child's lifecycle outcome, and a terminal observation reaches the recorded owner's rendered card even when the observation itself renders nowhere — a conflicting-parent completion terminalizes the owner's card (with its own outcome flavor) before any settle, so conflict handling can never leave a running card behind. The outcome is first-terminal-wins per child: once terminal, no later observation (running progress, contradicting tool record, snapshot) un-finishes, re-cancels, or re-flavors it.
+
+### 5.4 Stable projected step (round 4; FR15)
+
+The consumer keys subagent nodes `${toolCallId}:subagent:${step}` — `step` is part of the node identity downstream, not just display order. The bridge therefore assigns `step` **once, at first attributed attach**: the child's own `index` when present and not already used by a sibling under the same parent; otherwise the next free integer above the parent's current maximum. The step is frozen for the child's lifetime — later events or snapshots never renumber it — so duplicate fleet indices, missing indices, and event/snapshot disagreement cannot mint a second node for one child. Card ordering remains by step; identity remains the child `id`.
+
+**Tool-result observations share the rule** (round-4 follow-up): children reported in a `task` tool call's `results[]`/`progress[]` are registered like any other observation — attributed to the frame's own call (the parent reference there is the frame itself, never missing or unverifiable), step-assigned by the same rule, and mirrored into the per-call map so the sweep terminalizes their cards. The observation is **always merged** into the tracked child, frozen step or not; merging is terminal-sticky and **first-terminal-wins** — the outcome flavor (including a deliberate absence of one) freezes at the first terminal observation, and the canonical state is projected back into the outgoing frame unconditionally once the child is terminal, so a stale running update cannot emit a nonterminal card and a later completed record after failed/aborted cannot erase `stopReason`/`exitCode` (a contradicting flavor is stripped from the frame). A frozen registry step wins over a later-projected raw index in either direction, so a tool update and an event can never mint two nodes for one child, and a child the tool channel already reported completed is neither re-cancelled nor relabeled aborted by the interrupt. A tool-result entry naming a child whose established owner is a DIFFERENT call is a conflict: the duplicate entry is dropped from the projection, tracked adoption is refused (the registry owner stands), the canonical outcome still reaches the owner's card, and reconciliation is requested over the same channel as ambiguous updates.
+
+**Registry stickiness is attribution-independent** (round-4 follow-up): terminal stickiness lives in `registerObserved` itself, so it covers withheld children too — a parentless completion followed by stale running progress leaves the record `finished:true, live:false`, and the interrupt neither cancels nor re-renders it.
+
+**Status**: landed 2026-10-23 (T010–T016). Rules 1–4 preserve every pinned single-call behavior verbatim (suite green, including the pre-existing late-completion, parentless-single-call, and mid-turn-attach pins); rule 5 (registry-aware withhold) replaced the shipped `activeTaskCall` fallback (last-started call wins), which under the 2026-10-23 six-way fan-out minted four phantom cards under one parent. Pinned by the US9 block in `test/subagent.test.js` and the fleet-interrupt scenario in `test/e2e.test.js`.
+
+### 5.5 Upstream ask (FR18): consumer-side finalize sweep
+
+The bridge closes the interrupt path (§5.1–§5.3), but one hole is consumer-owned and cannot be repaired bridge-side: **T3 Code finalizes a run without sweeping its open subagent rows.**
+
+Evidence (extracted T3 0.1.2 Pi adapter, same extraction set as [../subagent-open-gap-report.md](../subagent-open-gap-report.md)):
+
+1. `finalizeTurn` runs on `agent_settled` and marks the turn done **without closing open subagent rows** — rows whose last `subagent.updated` said `status: running` keep that status in the orchestration store forever (incident 2026-10-23, thread `5fd61a7a`: ten rows frozen `running`).
+2. After finalization the adapter drops every further frame for the turn (`turn === null` gates both `tool_execution_update` and notify projection) — so terminal updates that arrive later can never heal the frozen rows.
+3. T3's own Codex adapter is the reference behavior: it propagates a parent-run interrupt down to child turns and closes them; the Pi adapter has no equivalent sweep.
+
+**Upstream change request (to T3 Code)**: `finalizeTurn` should close (or force-terminal) open subagent rows for the finalizing run, exactly as the Codex adapter propagates termination to child turns — covering *every* finalization path (interrupt, settle, error), not only the ones this bridge can pre-terminalize via §5.1.
+
+**Not bridge-repairable**: rows the consumer already finalized before this bridge's sweep runs (or before this round's fix is installed) stay as they are. The bridge does not fake-repair them — no synthetic updates are sent for finalized turns (the adapter would drop them, §5.1 ordering is what makes the live window work), and no consumer-side state is written directly. The honest disposition is this ask plus the bridge-side guarantee that every window the bridge *can* reach is closed: interrupt (§5.1), ambiguous children (§5.3), withheld cancellation (§5.3/FR19).

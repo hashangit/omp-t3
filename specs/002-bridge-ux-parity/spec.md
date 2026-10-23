@@ -10,8 +10,9 @@ This round delivers, in one coherent release:
 2. **Four integration UX improvements** — explain held-open runs, show drift in-thread, carry live subagent narration, and make first-launch discovery reliably complete within T3's discovery window.
 3. **One new parity feature** — click-to-open subagent sessions in T3's UI, conditional on what the provider surface actually allows; if it does not allow it, the round ships the evidence and the exact upstream ask instead of a partial UX. *(Resolved to the gap-report path — see US1.)*
 4. **Regression pins** for upstream behavioral changes (post-settle compaction events, rollback across compacted sessions, deferred extension loading) so the next upstream update cannot silently regress them.
+5. **Incident-driven subagent correctness** — interrupting a run with live subagents terminalizes every card and stops the actual children (no forever-"running" rows, no invisible orphan work), and concurrent task calls each own exactly their real children (no phantom cards, no misattributed work).
 
-Out of scope: any frame-shape change (audit found none needed), T3-side or coding-agent-side code changes (this round only changes the bridge), renegotiating the version scheme from feature 001, cross-session approval caching (cut in review — net-negative; see US5), and session-continuation translation (cut — verified unnecessary; see US7).
+Out of scope: any frame-shape change (audit found none needed), T3-side or coding-agent-side code changes (this round only changes the bridge), renegotiating the version scheme from feature 001, cross-session approval caching (cut in review — net-negative; see US5), session-continuation translation (cut — verified unnecessary; see US7), and repair of rows the consumer already finalized (existing zombie rows are documented alongside the upstream ask — see FR18).
 
 ## 1.2 Separation of Concerns & Zero-Fork Principle
 
@@ -73,6 +74,28 @@ The consumer doubled its discovery patience (15s → 30s). The bridge's cold-sta
 
 Today the resolver's call fails with "unknown option". The bridge MUST accept the self-update invocation. By default it MUST be a successful, clearly explained no-op (report install channel, install path, and the exact manual update command; exit 0) — unattended global package mutation is unacceptable. A real channel update (npm / Homebrew) MUST be executable only by explicit user opt-in (`update --yes`); a git checkout install is always guidance-only. It MUST never print an unknown-option error. `omp --check` reports the detected install channel.
 
+### US9: Trustworthy Subagent Attribution under Parallel Task Fan-Out (Priority: P1)
+
+**As a** T3 Code user on this bridge, **when** a single turn dispatches several task calls concurrently (a parallel subagent fleet), **I want** each subagent card to represent exactly one real child of its true parent, **so that** the subagent view never shows phantom agents or work attributed to the wrong parent.
+
+Incident (2026-10-23): six concurrent task calls rendered ten subagent cards — four phantoms with empty payloads, all attached to the last-started call. The coding agent emits child progress frames with no usable parent reference; the bridge attached each to the most recently started task call.
+
+- A child update without a usable parent reference MUST attach only when attribution is unambiguous: an explicit parent that is a known task call; a child the bridge has already attributed (its recorded owner); or the only task call ever seen in the session. An open task call alone is never proof of ownership — a parentless update arriving after its true parent's call ended (while a later call is open) MUST NOT land under that later call. Otherwise the update is withheld from rendering and the authoritative child list is requested.
+- Display order MUST NOT create identity: a fleet-wide child index orders cards; it never defines which parent owns a child. One child has one stable identity under one parent for its whole lifetime; repeated updates and snapshots refresh that same card. Because the consumer keys subagent nodes by parent + projected step, the projected step MUST be assigned once per child — its own index when present and unique among that parent's children, otherwise the next free slot — and never change: missing or duplicate indices and event/snapshot disagreement must never mint a second node for one child.
+- The stricter rule MUST NOT change the already-pinned single-task-call behaviors (a late completion frame during a later tool call still lands on its true parent; a parentless frame in a single-call run still lands on that call).
+
+### US10: Terminal Subagent Lifecycle on Interrupt (Priority: P1)
+
+**As a** T3 Code user on this bridge, **when** I interrupt a run that has live subagents, **I want** every subagent card to reach a terminal state and the actual children to stop, **so that** the view never shows agents "running" forever and no orphaned work keeps executing invisibly.
+
+Incident (2026-10-23): an interrupt finalized the run while ten subagent rows stayed "running" in the consumer's database forever, and the interrupted children kept executing detached with no owner.
+
+- On interrupt, terminal updates for every tracked unfinished child MUST reach the consumer before the run is finalized — after finalization the consumer drops all later updates, which is how the incident's rows froze.
+- The interrupt MUST be propagated to the children (cancellation requests to the coding agent), so detached children are hard-killed rather than running on invisibly.
+- Cancellation MUST cover every observed live child, including children whose parent the bridge could not resolve: a withheld card is unrendered, not untracked — the hidden child is still real and is cancelled by id (FR19).
+- Runs without tracked children MUST behave exactly as before (zero wire change).
+- The consumer's own finalization closes a run without sweeping open subagent rows; that gap is upstream. The bridge MUST NOT pretend to repair rows the consumer already finalized — the gap and the ask are documented (FR18).
+
 ---
 
 ## Functional Requirements
@@ -96,6 +119,14 @@ Today the resolver's call fails with "unknown option". The bridge MUST accept th
 - FR12: A verification run proves deferred extension loading does not delay the consumer's tool registration past the first message.
 - FR13: The full existing test suite passes; every new projected shape or notice gains a pinning test at the moment it ships (feature 001 §7.2 rule).
 
+**Subagent lifecycle & attribution (incident rounds 3–4)**
+- FR14: A child update whose parent reference is missing or unverifiable attaches only under unambiguous attribution — an explicit parent that is a known task call; else a child identity already attributed (its recorded owner); else the only task call ever seen; else (no task-call history) the explicit parent. An open task call alone is not attribution: once more than one task call has been seen, a parentless update for an unknown child is withheld from rendering and reconciliation is requested — even when exactly one task call is open. It is never attached to the most recently started call. Pinned by tests covering the six-concurrent-calls incident shape and the late-orphan shape (parent's call ended, later call open).
+- FR15: One child = one card for life: identity and parent are stable from first attribution; repeated events and snapshots update the existing card instead of minting a new one under another parent. The projected per-parent step is part of the consumer's node identity: it is assigned once at first attach (the child's own index when unique among that parent's children, else the next free integer) and never renumbered — duplicate or missing indices and event/snapshot disagreement cannot create a second node for one child.
+- FR16: On interrupt, every tracked unfinished child is terminalized in the consumer before run finalization, and a cancellation is sent for every live child before the interrupt is forwarded; runs without tracked children are wire-identical to before. (Round 3 — implemented and pinned.)
+- FR17: Reconciliation against the authoritative child list resolves children the event stream could not attribute (including FR14's withheld updates), enriches tracked cards, and never un-finishes an entry. (Round 3 — implemented; FR14 adds the ambiguity trigger.)
+- FR18: The consumer-side finalize-without-sweep gap is documented as an upstream ask with extracted evidence; already-finalized zombie rows are acknowledged as not bridge-repairable (no fake repair).
+- FR19: On interrupt, every observed live child is cancelled: attributed children via their owning call's terminal update plus per-child cancellation, unattributed (withheld) children by id from the live-child registry. A child the bridge never observed is unknowable and out of scope.
+
 ## Success Criteria
 
 - **SC1**: With the Codex provider as reference, a user can open a clicked subagent session over this bridge in the same number of interactions (zero extra steps); or, if the surface blocks it, a gap report exists that names the exact missing mechanism with extracted evidence (measurable: report names field + source location).
@@ -105,11 +136,13 @@ Today the resolver's call fails with "unknown option". The bridge MUST accept th
 - **SC6**: First launch with cold caches populates model list and commands on the first poll, measured within the consumer's 30s discovery window, with zero empty-first-poll occurrences across 5 consecutive cold starts.
 - **SC8**: The consumer's provider-maintenance resolver runs against the bridge without an unknown-option failure (exit 0, clear manual-update guidance; a real package-manager update happens only when a user invokes `omp-t3 update --yes`).
 - **SC9**: Zero regressions: full suite green before and after; every upstream behavioral pin (FR10–FR12) demonstrated passing.
+- **SC10**: A turn dispatching six concurrent task calls whose children report both parent-referencing and parentless updates renders exactly the real children — card count equals dispatched-children count, zero empty-payload cards, every card under its true parent, and a late parentless update arriving after its parent's call ended (while a later call runs) lands under no card. Interrupting that run leaves zero cards in a running state and cancels every dispatched child, attributed or not.
 
 ## Key Entities
 
 - **HoldOpenNotice** — authoritative subagent count (live unfinished subagent entries across open task calls) or the explicit "pending background work" fallback; lifecycle tied to the pending set (signature = `subagents:<n>` | `background`), cleared when the run settles.
 - **SubagentEntry (extended)** — existing fields (agent, task, step, finished, stop reason, model, messages) plus projected narration; no child-session identity (US1 resolved to the gap report).
+- **SubagentEntry (attribution, internal)** — parent ownership resolved at first attach under the FR14 rule; the bridge tracks the open-task-call set; an ambiguously parented update creates no entry (withheld for reconciliation).
 - **DriftNotice** — signature, side (bridge vs agent vs consumer), human-readable intervention description; shares the rate-limit ledger with issue filing; wired only to settle-synthesis (active-turn) reporting.
 
 ## Assumptions
@@ -118,6 +151,7 @@ Today the resolver's call fails with "unknown option". The bridge MUST accept th
 - T3's Codex provider is the reference UX for subagent openability.
 - If research shows the provider surface cannot support FR9, the conditional gap-report path of US1 satisfies this spec's intent (honest parity outcome, no fake UX).
 - omp accepts `--session`/`--fork` natively (verified 18.12.6), so session continuity is pure passthrough.
+- The coding agent's live-children snapshot is the authoritative child list (verified 18.12.6); attribution decisions may defer to it.
 
 ## Dependencies
 
@@ -128,3 +162,6 @@ Today the resolver's call fails with "unknown option". The bridge MUST accept th
 
 - **2026-10-23 (plan research)**: US1 conditional resolved to gap-report path (see US1 Resolution). FR7/SC5 refined from "default-on" to "runtime-mode-gated" — research R3 showed omp's approval default is `yolo` and the consumer's extension hook is the visible gate, so non-gated enablement would add prompts without cross-session benefit. Notice channel, discovery bound (10s), and deferred-loading acceptance decided in [research.md](./research.md).
 - **2026-10-23 (implementation review)**: scope corrected and cut item states recorded here. US5/FR7/SC5 cut (approval machinery: net-negative, no in-thread suppress path exists; upstream ask retained). US7/SC7/FR3 cut: omp accepts `--session`/`--fork` natively (live-verified) — FR1 is now a byte-passthrough pin and the help text stands. US3 narrowed to settle-synthesis notices before the settle (the only active-turn intervention; consumer drops notices when no turn is active) with discovery failures kept off-thread. FR4 hold text corrected to honest data (no invented kind/count — omp exposes only `get_state.hasPendingAsyncWork`; subagent counts come from the bridge's own live entries). FR2 landed as no-op default + `--yes` opt-in (T3 calls `update --self` routinely from its provider maintainer; global mutation stays user-initiated). FR12's verification is a live `--check` ledger probe (agent.db `cache` table) plus quickstart steps, not a live-omp unit test.
+- **2026-10-23 (round 3 — incident `5fd61a7a`)**: interrupt-with-live-subagents froze ten subagent rows "running" forever and left detached children executing. US10/FR16–FR17 added; implemented (abort sweep before any settle synthesis, per-child cancellation, snapshot reconciliation) and pinned (`test/subagent.test.js`, `test/e2e.test.js`); wire contract in [contracts/frame-contract.md](./contracts/frame-contract.md) §5.
+- **2026-10-23 (round 4 — fault analysis)**: phantom-row root cause isolated — the single-active-task-call attribution fallback under parallel fan-out (the pinned parentless-frame test covered only the single-call case). US9/FR14–FR15 added (remaining implementation; rule specified in frame-contract §5.3); consumer-side finalize-without-sweep recorded as upstream ask (FR18).
+- **2026-10-23 (round 4 review — fix then implement)**: three pre-implementation gaps closed. (1) The sole-open-call rule still misattributed a late orphan (parent's call ended, later call open) — child-registry-first resolution replaces it; an open call alone never attributes an unknown child. (2) Withheld children stayed invisible to the interrupt sweep — a live-child registry now guarantees cancellation by id even when rendering is withheld (FR19). (3) `step` is part of the consumer's node key, so the child index is not mere display order — assign-once stable-step rule added (FR15, contract §5.4). The impossibility claim is scoped: misattributed rendering is impossible; unattributable children are unrendered, never misrendered, still cancelled.

@@ -205,14 +205,14 @@ function createProxyPipeline(options) {
         }
       }
       const subResult = subagentBridge.handleDownstreamFrame(trimmed);
-      if (subResult.handled && subResult.line) {
-        clientOut.write(subResult.line);
-        // A new task tool call opened: reconcile against omp's snapshot so
-        // card details (names, mandates, models) survive missed events.
-        if (subResult.taskStarted) requestSubagentRefresh();
+      if (subResult.handled) {
+        if (subResult.line) clientOut.write(subResult.line);
+        // A new task tool call opened, or an ambiguous child update was
+        // withheld (FR14): reconcile against omp's authoritative snapshot —
+        // it carries explicit parents and can attribute the withheld child.
+        if (subResult.taskStarted || subResult.refreshRequested) requestSubagentRefresh();
         return;
       }
-      if (subResult.handled) return; // raw subagent_* frames stay suppressed
 
       // 4. Byte-preserving transparent passthrough (diffs, streaming tokens, dialogs, usage)
       clientOut.write(line + '\n');

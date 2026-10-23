@@ -505,3 +505,139 @@ test('E2E: idle interrupt (paused run) still sweeps subagents before the immedia
 
   pipeline.stop();
 });
+
+test('E2E: parallel fleet + mid-run interrupt renders exactly the real children and cancels the withheld ones', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  const childLines = collectLines(childIn);
+  pipeline.start();
+
+  // Six concurrent task calls open in one turn (the review fleet).
+  clientIn.write('{"type": "prompt", "message": "run the review fleet"}\n');
+  childOut.write('{"type":"agent_start"}\n');
+  for (let i = 1; i <= 6; i++) {
+    childOut.write(`{"type":"tool_execution_start","toolCallId":"c${i}","toolName":"task","args":{}}\n`);
+  }
+  await new Promise((r) => setImmediate(r));
+
+  // omp's authoritative snapshot seeds four children with explicit parents.
+  const refresh = childLines.getJson().find((f) => f.type === 'get_subagents');
+  assert.ok(refresh, 'task calls trigger reconciliation');
+  childOut.write(JSON.stringify({
+    type: 'response', id: refresh.id, command: 'get_subagents', success: true,
+    data: { subagents: [1, 2, 3, 4].map((i) => ({
+      id: `s${i}`, index: i - 1, agent: `reviewer-${i}`, status: 'running',
+      task: `review slice ${i}`, parentToolCallId: `c${i}`
+    })) }
+  }) + '\n');
+  // A fifth child arrives via an explicit event on c5, and one parentless
+  // unknown child is reported with all six calls open (the incident shape).
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c5","id":"s5","index":4,"status":"running","agent":"reviewer-5"}}\n');
+  childOut.write('{"type":"subagent_progress","payload":{"progress":{"id":"ghost","index":9,"status":"running"}}}\n');
+  await new Promise((r) => setImmediate(r));
+
+  // Exactly the real children render, each under its true parent; the
+  // withheld child renders nowhere (no phantom cards).
+  let frames = clientLines.getJson();
+  const cardCalls = new Set(
+    frames.filter((f) => f.type === 'tool_execution_update' && f.toolName === 'subagent')
+      .map((f) => f.toolCallId)
+  );
+  assert.deepEqual([...cardCalls].sort(), ['c1', 'c2', 'c3', 'c4', 'c5'], 'one card parent per real child');
+  const rendered = new Set();
+  for (const f of frames) {
+    if (f.type === 'tool_execution_update' && f.toolName === 'subagent') {
+      for (const r of f.partialResult.details.results) rendered.add(r.agent);
+    }
+  }
+  assert.equal(rendered.size, 5, 'card count equals real-children count');
+  assert.ok(![...rendered].some((a) => a.includes('ghost')), 'the withheld child is unrendered');
+
+  // Mid-run interrupt.
+  clientIn.write('{"type": "abort"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  // Every rendered card reaches a terminal state; no settle jumps ahead.
+  frames = clientLines.getJson();
+  assert.ok(!frames.some((f) => f.type === 'agent_settled'), 'active-cycle abort waits for agent_end');
+  for (const callId of ['c1', 'c2', 'c3', 'c4', 'c5']) {
+    const terminal = frames.find(
+      (f) => f.type === 'tool_execution_update' && f.toolCallId === callId
+        && f.partialResult.details.results.every((r) => r.finished === true && r.stopReason === 'aborted')
+    );
+    assert.ok(terminal, `${callId} card terminalized within the live window`);
+  }
+
+  // Every dispatched child is cancelled - attributed AND withheld - before
+  // the abort is forwarded to omp.
+  const childFrames = childLines.getJson();
+  const cancels = childFrames.filter((f) => f.type === 'cancel_subagent');
+  assert.deepEqual(
+    cancels.map((c) => c.subagentId).sort(),
+    ['ghost', 's1', 's2', 's3', 's4', 's5'],
+    'every observed live child is cancelled by id, including the withheld one'
+  );
+  for (const c of cancels) assert.ok(c.id.startsWith('ompt3-sub-'));
+  const abortIdx = childFrames.findIndex((f) => f.type === 'abort');
+  for (const c of cancels) assert.ok(childFrames.indexOf(c) < abortIdx, 'cancels precede the forwarded abort');
+
+  // The run settles exactly once and nothing stays running.
+  childOut.write('{"type":"agent_end"}\n');
+  await new Promise((r) => setImmediate(r));
+  frames = clientLines.getJson();
+  const settle = frames.find((f) => f.type === 'agent_settled');
+  assert.ok(settle && settle.aborted === true, 'aborted fleet settles once');
+  assert.equal(frames.filter((f) => f.type === 'agent_settled').length, 1);
+  const afterSettle = frames.slice(frames.indexOf(settle) + 1);
+  assert.ok(
+    !afterSettle.some((f) => f.type === 'tool_execution_update' && f.partialResult?.details?.results?.some((r) => r.finished === false)),
+    'zero cards still running after the settle'
+  );
+
+  pipeline.stop();
+});
+
+test('E2E: conflicting-parent completion terminalizes the owner card before the settle', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  pipeline.start();
+
+  // The final-check report's reproduction, verbatim:
+  // 1. agent_start; task calls A and B.
+  clientIn.write('{"type": "prompt", "message": "fleet"}\n');
+  childOut.write('{"type":"agent_start"}\n');
+  childOut.write('{"type":"tool_execution_start","toolCallId":"callA","toolName":"task","args":{}}\n');
+  childOut.write('{"type":"tool_execution_start","toolCallId":"callB","toolName":"task","args":{}}\n');
+  // 2. child kid running under A - A's card renders running.
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callA","id":"kid","index":0,"status":"running","agent":"scout"}}\n');
+  // 3. the same child completed with explicit parent B.
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callB","id":"kid","index":0,"status":"completed"}}\n');
+  // 4. parent cycle ends, then omp settles.
+  childOut.write('{"type":"agent_end"}\n');
+  childOut.write('{"type":"session_settled"}\n');
+  await new Promise((r) => setImmediate(r));
+
+  const frames = clientLines.getJson();
+  const ownerUpdateIdx = frames.findIndex(
+    (f) => f.type === 'tool_execution_update' && f.toolCallId === 'callA'
+      && f.partialResult.details.results[0]?.finished === true
+  );
+  const settleIdx = frames.findIndex((f) => f.type === 'agent_settled');
+  assert.ok(ownerUpdateIdx !== -1, 'owner card reached its terminal state');
+  assert.ok(settleIdx !== -1);
+  assert.ok(ownerUpdateIdx < settleIdx, 'terminal update precedes the settle - no zombie card');
+  const ownerUpdate = frames[ownerUpdateIdx];
+  assert.equal(ownerUpdate.partialResult.details.results[0].stopReason, undefined, 'completed, not aborted');
+  assert.equal(frames.some((f) => f.type === 'tool_execution_update' && f.toolCallId === 'callB'), false, 'no card under the conflicting parent');
+  const afterSettle = frames.slice(settleIdx + 1);
+  assert.ok(
+    !afterSettle.some((f) => f.type === 'tool_execution_update' && f.partialResult?.details?.results?.some((r) => r.finished === false)),
+    'zero running rows past finalization'
+  );
+
+  pipeline.stop();
+});
