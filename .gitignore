@@ -14,3 +14,13 @@ Thumbs.db
 coverage/
 dist/
 build/
+
+#Agents
+.agents
+.claude
+.cline
+.codex
+.cursor
+.gemini
+.github
+.opencode

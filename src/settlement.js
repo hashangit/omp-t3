@@ -34,6 +34,35 @@ class SettlementTracker {
     // True between an upstream abort command and the settle synthesized for
     // it, so the synthesized settle reports aborted:true.
     this.sawAbort = false;
+    // Hold-open observers (feature 002 FR4). Invoked whenever a frame proves
+    // settlement is withheld because async work is pending. The proxy wires
+    // these to the notice channel; both are optional so standalone tracker
+    // use (tests) stays silent.
+    this.onHoldOpen = null;
+    this.pendingSubagents = null;
+    // Interrupt observer: fired synchronously inside the upstream abort
+    // branch, BEFORE any settle synthesis is returned to the proxy. The
+    // proxy uses it to terminalize tracked subagents for T3 and to cancel
+    // omp-side children while the T3 turn is still active (after
+    // agent_settled the Pi adapter drops every frame).
+    this.onAbort = null;
+  }
+
+  /**
+   * Build hold-open info for the notice channel. The subagent count is
+   * supplied by the proxy (SubagentBridge.pendingCount) and is authoritative
+   * only when at least one live unfinished subagent is tracked — omp exposes
+   * background jobs as a boolean, never counts.
+   * @returns {{ pendingSubagents: number, countAuthoritative: boolean }}
+   */
+  holdInfo() {
+    const count = typeof this.pendingSubagents === 'function' ? this.pendingSubagents() : 0;
+    return { pendingSubagents: count, countAuthoritative: count > 0 };
+  }
+
+  /** Fires the hold-open observer when one is wired. */
+  tickHoldOpen() {
+    if (typeof this.onHoldOpen === 'function') this.onHoldOpen(this.holdInfo());
   }
 
   /**
@@ -71,6 +100,10 @@ class SettlementTracker {
     ) {
       this.lastPromptStatus = 'aborted';
       this.sawAbort = true;
+      // Subagent stop translation must land while T3's turn is still
+      // active: the hook writes terminal subagent updates to T3 and
+      // cancel_subagent requests to omp before the settle below.
+      if (typeof this.onAbort === 'function') this.onAbort();
       // Idle abort: no agent cycle is open (background work pending, session
       // paused), so no agent_end will follow to synthesize the settle from -
       // and omp withholds session_settled while the work stays pending.
@@ -269,6 +302,11 @@ class SettlementTracker {
           emit: JSON.stringify({ type: 'agent_settled', aborted: status === 'aborted' }) + '\n'
         };
       }
+      // sessionSettled:false proves settlement is withheld for pending work
+      // (feature 002 FR4): the run stays open by design, so say so in-thread.
+      if (agentInvoked && parsedSessionSettled === false) {
+        this.tickHoldOpen();
+      }
       // Suppress prompt_result because T3 PiAdapter does not recognize it
       return { handled: true, suppress: true };
     }
@@ -308,6 +346,12 @@ class SettlementTracker {
         ) {
           parsed.data.pendingMessageCount =
             parsed.data.queuedMessageCount + (parsed.data.hasPendingAsyncWork === true ? 1 : 0);
+          // T3's settle probe is the recurring proof that async work is still
+          // pending mid-run; refresh the hold-open signature from it too (the
+          // subagent count may have become known since prompt_result).
+          if (parsed.data.hasPendingAsyncWork === true) {
+            this.tickHoldOpen();
+          }
           return { handled: true, emit: JSON.stringify(parsed) + '\n' };
         }
       } catch {

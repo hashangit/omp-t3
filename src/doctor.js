@@ -4,10 +4,16 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { exec, execFile } = require('node:child_process');
+const { notifyFrame } = require('./notices.js');
 
 const ISSUE_REPO = 'hashangit/omp-t3';
 const ISSUE_RATE_LIMIT_MS = 24 * 60 * 60 * 1000;
 const SETTLE_WATCHDOG_MS = 15_000; // omp writes session_settled promptly after a settled prompt_result
+
+// Module-level so every doctor instance shares one notify id sequence; ids
+// are diagnostic only (the consumer's notify path ignores them), but keeping
+// them unique per process avoids confusing log correlation.
+let noticeSeq = 0;
 
 function statePath() {
   const stateHome = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state');
@@ -48,6 +54,12 @@ class ContractDoctor {
     this.state = loadState();
     this.settleTimer = null;
     this.pendingSettle = null;
+    // Feature 002 FR5: in-thread notice hook. When set, a drift report
+    // additionally writes an extension_ui_request notify frame to the
+    // consumer. Only set by the proxy, and only honored for reports that
+    // happen while a turn is active (the watchdog) — discovery failures run
+    // before any turn exists, where the consumer renders nothing.
+    this.onNotice = null;
   }
 
   /** Wires runtime context after the omp child is resolved. */
@@ -124,7 +136,7 @@ class ContractDoctor {
       title: `OMP ${this.currentOmpVersion() || '?'} stopped emitting session_settled after a settled prompt_result`,
       detail: 'T3 Code only finalizes turns on Pi agent_settled, which omp-t3 synthesizes from OMP session_settled. OMP announced settlement (prompt_result with sessionSettled=true) but never wrote the session_settled frame, so turns would hang forever. omp-t3 synthesized the settle frame as a stopgap.',
       sample: { expected: 'session_settled within 15s of prompt_result {agentInvoked:true, sessionSettled:true}' }
-    });
+    }, { notify: true });
     const settleLine = JSON.stringify({ type: 'agent_settled', aborted: status === 'aborted' }) + '\n';
     if (typeof this.onSynth === 'function') this.onSynth(settleLine);
     return settleLine;
@@ -150,8 +162,15 @@ class ContractDoctor {
    * Reports a drift, shows rollback guidance on stderr, and files a GitHub
    * issue at most once per signature per day.
    * @param {{ signature: string, side: string, title: string, detail: string, sample: object }} drift
+   * @param {{ notify?: boolean }} [options] `notify: true` additionally
+   *   renders the drift in-thread (feature 002 FR5) through the `onNotice`
+   *   hook, only when the same 24h rate-limit ledger admits it. Discovery
+   *   failures must NOT pass it: they occur before any turn exists, where
+   *   the consumer renders nothing. Callers that need deterministic ordering
+   *   (notice before a synthesized settle) get it — report() writes the
+   *   notice synchronously before returning.
    */
-  report(drift) {
+  report(drift, options = {}) {
     const lastGood = this.state.lastGood;
     const rolledBackFrom = lastGood && lastGood.ompVersion !== this.currentOmpVersion() ? lastGood.ompVersion : null;
 
@@ -177,6 +196,12 @@ class ContractDoctor {
     if (now - lastFiled < ISSUE_RATE_LIMIT_MS) return;
     this.state.issuesFiled[drift.signature] = now;
     saveState(this.state);
+    // In-thread notice (FR5): shares the issue ledger's rate limit, and is
+    // written synchronously so it can precede frames emitted by the caller.
+    if (options.notify && typeof this.onNotice === 'function') {
+      noticeSeq += 1;
+      this.onNotice(notifyFrame(noticeSeq, `omp-t3 contract drift: ${drift.title}`));
+    }
     if (this.issuesEnabled) this.fileIssue(drift, lastGood, rolledBackFrom);
   }
 
