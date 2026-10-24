@@ -857,3 +857,77 @@ test('FR17: conflicting failed status carries the error outcome to the owner', (
   assert.ok(JSON.parse(conflict.line).partialResult.content[0].text.includes('1 failed/aborted'));
   assert.equal(bridge.childRegistry.get('kid').stopReason, 'error');
 });
+
+// --- P2-1 repair: unseen explicit parents are adopted, not hijacked ---
+
+test('P2-1: two unseen mid-turn calls each keep their own children and cards', () => {
+  const bridge = new SubagentBridge();
+  // No task start was ever seen (shim attached mid-turn): two children
+  // arrive, each with a DIFFERENT unseen explicit parent.
+  const x1 = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callX","id":"X1","index":0,"status":"running","agent":"scout"}}');
+  assert.equal(JSON.parse(x1.line).toolCallId, 'callX');
+  const y1 = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callY","id":"Y1","index":0,"status":"running","agent":"auditor"}}');
+  assert.equal(JSON.parse(y1.line).toolCallId, 'callY', 'second unseen call must NOT hijack into the first');
+  assert.equal(bridge.childRegistry.get('Y1').ownerCallId, 'callY');
+  assert.equal(bridge.subagentsByCall.get('callY').get('Y1').agent, 'auditor');
+
+  // The interrupt closes BOTH cards and cancels both children.
+  const sweep = bridge.abortSweep();
+  assert.deepEqual(sweep.toOmp.map((l) => JSON.parse(l).subagentId).sort(), ['X1', 'Y1']);
+  assert.deepEqual(sweep.toClient.map((l) => JSON.parse(l).toolCallId).sort(), ['callX', 'callY']);
+});
+
+test('P2-1: a late parentless follow-up from a second-call child follows its true parent', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callX","id":"X1","index":0,"status":"running"}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callY","id":"Y1","index":0,"status":"running"}}');
+  // Parentless completion of the SECOND call's child: registry owner wins.
+  const res = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"id":"Y1","index":0,"status":"completed"}}');
+  assert.equal(JSON.parse(res.line).toolCallId, 'callY');
+  assert.equal(JSON.parse(res.line).partialResult.content[0].text, '1/1 done');
+});
+
+test('distrusted parent: an explicit parent seen as a non-task tool is never adopted', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"c1","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"w1","toolName":"wait","args":{}}');
+  // Late event misattributed by omp to the wait call: must land on c1.
+  const res = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"w1","id":"kid","index":0,"status":"running","agent":"scout"}}');
+  assert.equal(JSON.parse(res.line).toolCallId, 'c1', 'non-task parents are distrusted; sole task call wins');
+});
+
+// --- Post-abort cancellation window (notification-bar stop hardening) ---
+
+test('abort window: children surfacing after the sweep are cancelled on observation', () => {
+  const bridge = new SubagentBridge();
+  const cancels = [];
+  bridge.onOmpLine = (l) => cancels.push(JSON.parse(l));
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
+  // Sweep on the childless open call: window armed, nothing to cancel yet.
+  const sweep = bridge.abortSweep();
+  assert.deepEqual(sweep.toOmp, []);
+  const end = JSON.parse(sweep.toClient[0]);
+  assert.ok(end.result.content[0].text.includes('0/0 done'));
+
+  // In-flight spawn finishes AFTER the sweep: observed live → insta-cancel.
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_1","id":"late","index":0,"status":"running","agent":"straggler"}}');
+  assert.deepEqual(cancels.map((c) => c.subagentId), ['late'], 'window cancels the straggler');
+  assert.equal(bridge.childRegistry.get('late').stopReason, 'aborted');
+  assert.equal(bridge.childRegistry.get('late').live, false);
+});
+
+test('abort window: a new prompt disarms it (next turn spawns freely)', () => {
+  const bridge = new SubagentBridge();
+  const cancels = [];
+  bridge.onOmpLine = (l) => cancels.push(JSON.parse(l));
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"c1","toolName":"task","args":{}}');
+  bridge.abortSweep();
+  // The proxy calls disarmAbort() on prompt/abort_and_prompt frames (see
+  // src/proxy.js upstream path) — mirrored here directly.
+  bridge.handleDownstreamFrame('{"type":"prompt","message":"next turn"}');
+  bridge.disarmAbort();
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"c2","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c2","id":"fresh","index":0,"status":"running","agent":"scout"}}');
+  assert.deepEqual(cancels, [], 'disarmed: new-turn children are never cancelled');
+  assert.equal(bridge.pendingCount(), 1, 'new-turn child counts as pending work');
+});

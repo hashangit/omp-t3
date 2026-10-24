@@ -42,7 +42,7 @@
  * - `refreshRequest()`/`mergeSnapshots()`: periodic get_subagents
  *   reconciliation (single-flight, rate-limited). omp's snapshot is the
  *   authoritative live child list — it heals missed spawn/lifecycle
- *   events, attributes withheld children, and keeps names, mandates, and
+ *   events, attributes withheld children, and keeps names, models, and
  *   narration current. Snapshots never un-finish an entry: events stay
  *   authoritative for terminal states.
  * - `pendingCount()`: live unfinished children across open calls, feeding
@@ -93,6 +93,18 @@ class SubagentBridge {
     // `step` freezes at first attributed attach (FR15); `live` flips false
     // on terminal status and when the sweep cancels the entry.
     this.childRegistry = new Map();
+    // Tool call ids SEEN as started non-task tools (wait/bash/...): an
+    // explicit parent pointing at one of these is omp's late-event
+    // misattribution and is never trusted for adoption (they steal
+    // children; only unseen ids can be adopted as missed task starts).
+    this.nonTaskCalls = new Set();
+    // Post-abort cancellation window (see disarmAbort): while armed, any
+    // newly observed live child is cancelled the moment it is registered —
+    // omp children that surface after the sweep ran (in-flight spawn
+    // finishing, late snapshot) would otherwise run to completion with
+    // nobody holding their id. The proxy wires onOmpLine to omp's stdin.
+    this.abortArmed = false;
+    this.onOmpLine = null;
     // Bridge-injected RPC state (ompt3-sub- id namespace): sequence counter
     // plus single-flight/rate-limit state for get_subagents reconciliation.
     this.seq = 0;
@@ -179,11 +191,17 @@ class SubagentBridge {
 
     const invoked = parsed.toolName === 'task' || parsed.tool === 'task' || parsed.name === 'task';
 
-    if (parsed.type === 'tool_execution_start' && invoked && parsed.toolCallId) {
-      const isNew = !this.taskCalls.has(parsed.toolCallId);
-      this.taskCalls.add(parsed.toolCallId);
-      this.openCalls.add(parsed.toolCallId);
-      if (isNew) this.newTaskCallStarted = true;
+    if (parsed.type === 'tool_execution_start' && parsed.toolCallId) {
+      if (invoked) {
+        const isNew = !this.taskCalls.has(parsed.toolCallId);
+        this.taskCalls.add(parsed.toolCallId);
+        this.openCalls.add(parsed.toolCallId);
+        if (isNew) this.newTaskCallStarted = true;
+      } else {
+        // Started non-task tool (wait/bash/...): an explicit parent pointing
+        // here is a distrusted late-event misattribution (see resolveCallId).
+        this.nonTaskCalls.add(parsed.toolCallId);
+      }
     }
 
     if (!invoked) return { handled: false };
@@ -377,11 +395,17 @@ class SubagentBridge {
       if (explicit && this.taskCalls.has(explicit) && explicit !== owner) return null;
       return owner;
     }
-    if (explicit && this.taskCalls.has(explicit)) return explicit;
+    // An explicit parent is trusted unless this bridge has SEEN the id as a
+    // started non-task tool (wait/bash steal children upstream). Unseen ids
+    // are adopted as missed task starts by the caller (adoptUnseenCall) —
+    // this covers mid-turn attach AND the ≥2-missed-starts shape (gate
+    // finding P2-1: rule 3's sole-known-call fallback used to hijack a
+    // second unseen call's children into the first adopted call and leave
+    // its card unclosed at interrupt).
+    if (explicit && !this.nonTaskCalls.has(explicit)) return explicit;
     if (this.taskCalls.size === 1) {
       for (const only of this.taskCalls) return only;
     }
-    if (this.taskCalls.size === 0) return explicit || null;
     return null;
   }
 
@@ -398,6 +422,28 @@ class SubagentBridge {
     if (!t.finished) return;
     entry.finished = true;
     if (t.stopReason !== undefined) entry.stopReason = t.stopReason;
+  }
+
+  /**
+   * Disarms the post-abort cancellation window. Called by the proxy when a
+   * new turn starts (prompt / abort_and_prompt): children spawned for the
+   * new turn are legitimate work, not stragglers of the interrupted run.
+   */
+  disarmAbort() {
+    this.abortArmed = false;
+  }
+
+  /**
+   * Builds one bridge-injected `cancel_subagent` request line for omp.
+   * @param {string} childId
+   * @returns {string}
+   */
+  cancelLineFor(childId) {
+    return JSON.stringify({
+      id: `ompt3-sub-${++this.seq}`,
+      type: 'cancel_subagent',
+      subagentId: childId
+    }) + '\n';
   }
 
   /**
@@ -470,11 +516,12 @@ class SubagentBridge {
     const toClient = [];
     const toOmp = [];
     const cancelled = new Set();
-    const cancelLine = (childId) => JSON.stringify({
-      id: `ompt3-sub-${++this.seq}`,
-      type: 'cancel_subagent',
-      subagentId: childId
-    }) + '\n';
+    // Arm the post-abort cancellation window: children that surface after
+    // this sweep (in-flight spawn finishing, late snapshot before the
+    // settle) are cancelled on observation via onOmpLine until the next
+    // turn's prompt disarms it.
+    this.abortArmed = true;
+    const cancelLine = (childId) => this.cancelLineFor(childId);
     // Pass 1: terminalize tracked children under any call, open or ended.
     for (const [, calls] of this.subagentsByCall) {
       for (const [childId, entry] of calls) {
@@ -567,6 +614,17 @@ class SubagentBridge {
     // their entry's sticky state; withheld ones (ownerCallId null) rely on
     // this rule alone.
     rec.live = rec.finished === true ? false : observation.live;
+    // Post-abort cancellation window: a child surfacing after the sweep ran
+    // (in-flight spawn finishing, late snapshot/tool frame before the
+    // settle) is cancelled on observation — nobody else holds its id.
+    if (this.abortArmed && rec.live === true) {
+      rec.live = false;
+      rec.finished = true;
+      if (rec.stopReason === undefined) rec.stopReason = 'aborted';
+      if (typeof this.onOmpLine === 'function') {
+        this.onOmpLine(this.cancelLineFor(childId));
+      }
+    }
     return rec;
   }
 
@@ -687,7 +745,7 @@ class SubagentBridge {
 
   /**
    * Merges omp `get_subagents` snapshots into the tracked per-call maps.
-   * Snapshots enrich (agent name, mandate, model, narration) and can
+   * Snapshots enrich (agent name, model, narration) and can
    * surface children the event stream never delivered; they never
    * un-finish an entry (events are authoritative for terminal states) and
    * terminal children are absent from snapshots by construction.

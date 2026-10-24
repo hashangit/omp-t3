@@ -117,7 +117,7 @@ function subagentOverlayPath(max) {
  */
 function subagentCapArgs(rawValue) {
   if (rawValue === undefined || rawValue === null || rawValue === '') return [];
-  if (!/^\d+$/.test(rawValue) || Number(rawValue) < 1) {
+  if (!/^\d+$/.test(rawValue) || Number(rawValue) < 1 || !Number.isSafeInteger(Number(rawValue))) {
     const shown = String(rawValue).replace(/[\u0000-\u001f\u007f]/g, '?');
     console.error(`[omp-t3] Ignoring OMPT3_MAX_SUBAGENTS='${shown}': expected a plain positive integer (e.g. 5).`);
     return [];
@@ -128,7 +128,12 @@ function subagentCapArgs(rawValue) {
     fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
     const tmp = `${overlayPath}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, `task:\n  maxConcurrency: ${max}\n`);
-    fs.renameSync(tmp, overlayPath);
+    try {
+      fs.renameSync(tmp, overlayPath);
+    } catch (renameErr) {
+      fs.rmSync(tmp, { force: true });
+      throw renameErr;
+    }
     return ['--config', overlayPath];
   } catch (err) {
     console.error(`[omp-t3] OMPT3_MAX_SUBAGENTS=${max} ignored: cannot write the config overlay (${err.message}); launching without the cap.`);
