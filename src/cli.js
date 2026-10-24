@@ -9,15 +9,16 @@ const pkg = require('../package.json');
 
 /**
  * Built-in tools enabled for T3-mediated sessions when delegation
- * enforcement is on (default): omp's full default set (read, bash, edit,
- * write, grep, glob, lsp, python, notebook, browser, todo, web_search,
- * ask) MINUS `task` — the in-process subagent spawner. `computer` stays
- * excluded (disabled by default in omp). Version-pinned against the
- * supported omp releases; update when a supported release adds a tool.
+ * enforcement is on (default): the host-valid subset of omp's built-in
+ * registry MINUS `task` — the in-process subagent spawner. Derived per
+ * launch by the bin/omp-t3 pre-flight prune loop (omp's validator names
+ * exactly which entries are unknown/unavailable on the running host), so
+ * host and version differences self-correct. Setup-gated plugins (python,
+ * notebook, browser, computer) are never in the registry.
  */
 const DEFAULT_TOOLS = [
-  'read', 'bash', 'edit', 'write', 'grep', 'glob', 'lsp', 'python',
-  'notebook', 'browser', 'todo', 'web_search', 'ask'
+  'read', 'bash', 'edit', 'write', 'grep', 'glob', 'lsp', 'ast_edit',
+  'ask', 'debug', 'eval', 'find', 'wait', 'todo', 'web_search'
 ];
 
 /**
@@ -203,6 +204,32 @@ function subagentCapArgs(rawValue) {
 }
 
 /**
+ * Removes the flags this shim injects for delegation enforcement (the
+ * --tools pair and any --append-system-prompt[=value]) from omp argv.
+ * Used by the launch pre-flight: if omp rejects the injected tool list,
+ * the launch degrades to stock tooling (policy appendix dropped too —
+ * partial enforcement beats a dead provider).
+ * @param {string[]} ompArgs
+ * @returns {string[]} sanitized argv
+ */
+function stripInjectedDelegationArgs(ompArgs) {
+  const out = [];
+  for (let i = 0; i < ompArgs.length; i++) {
+    const arg = ompArgs[i];
+    if (arg === '--tools' || arg.startsWith('--tools=')) {
+      if (arg === '--tools') i++; // skip the list value
+      continue;
+    }
+    if (arg === '--append-system-prompt' || arg.startsWith('--append-system-prompt=')) {
+      if (arg === '--append-system-prompt') i++; // skip the policy value
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+/**
  * Resolves the path to the real omp executable.
  * @returns {string} Absolute path to omp binary
  */
@@ -262,5 +289,8 @@ module.exports = {
   resolveOmpPath,
   shimVersionInfo,
   subagentOverlayPath,
-  subagentCapArgs
+  subagentCapArgs,
+  stripInjectedDelegationArgs,
+  DEFAULT_TOOLS,
+  DELEGATION_POLICY
 };
