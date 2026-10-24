@@ -393,7 +393,7 @@ test('E2E: run mirrors the omp session - stays open while work is pending, settl
   pipeline.stop();
 });
 
-test('E2E: interrupt with live subagents terminalizes cards, then cancels omp children', async () => {
+test('E2E: interrupt with live subagents closes the task card, then cancels omp children', async () => {
   const { stdin: clientIn, stdout: clientOut } = createMockStreams();
   const { stdin: childIn, stdout: childOut } = createMockStreams();
   const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
@@ -416,8 +416,9 @@ test('E2E: interrupt with live subagents terminalizes cards, then cancels omp ch
   await new Promise((r) => setImmediate(r));
   let frames = clientLines.getJson();
   assert.ok(
-    frames.some((f) => f.type === 'tool_execution_update' && f.partialResult?.details?.results?.some((r) => r.agent === 'red-team')),
-    'snapshot child reaches T3 as a named card'
+    frames.some((f) => f.type === 'tool_execution_update' && f.toolName === 'task'
+      && f.partialResult?.content?.[0]?.text?.includes('red-team')),
+    'snapshot child reaches T3 inside the task card status line'
   );
 
   // Two more live children arrive via events, then T3 interrupts the run.
@@ -429,22 +430,18 @@ test('E2E: interrupt with live subagents terminalizes cards, then cancels omp ch
   await new Promise((r) => setImmediate(r));
 
   frames = clientLines.getJson();
-  const terminalIdx = frames.findIndex(
-    (f) => f.type === 'tool_execution_update' && f.toolCallId === 'call_1'
-      && f.partialResult.details.results.every((r) => r.finished === true)
+  const endIdx = frames.findIndex(
+    (f) => f.type === 'tool_execution_end' && f.toolCallId === 'call_1'
+      && f.result?.content?.[0]?.text?.includes('interrupted')
   );
   // Active cycle is still open: the settle only follows omp's agent_end
-  // below, so at this point the terminal update must exist and no settle
-  // may have jumped ahead of it.
+  // below, so the card must be closed by then and no settle may have
+  // jumped ahead of it.
   const settleIdx = frames.findIndex((f) => f.type === 'agent_settled');
   assert.equal(settleIdx, -1, 'active-cycle abort waits for agent_end');
-  assert.ok(terminalIdx !== -1, 'interrupt terminalizes every tracked subagent');
-  const terminal = frames[terminalIdx].partialResult.details.results;
-  assert.equal(terminal.length, 3, 'snapshot child, event children - all three present');
-  for (const entry of terminal) {
-    assert.equal(entry.finished, true);
-    assert.equal(entry.stopReason, 'aborted', `${entry.agent} reads as interrupted in T3`);
-  }
+  assert.ok(endIdx !== -1, 'interrupt closes the open task card');
+  assert.ok(frames[endIdx].result.content[0].text.includes('3/3 done'), 'all three children terminal in the closing summary');
+  assert.ok(frames[endIdx].result.content[0].text.includes('3 failed/aborted'), 'interrupted children read as failures');
 
   // omp is told to hard-kill every live child, before the abort is forwarded.
   const childFrames = childLines.getJson();
@@ -468,11 +465,11 @@ test('E2E: interrupt with live subagents terminalizes cards, then cancels omp ch
     frames.every((f) => !(f.type === 'response' && f.command === 'cancel_subagent')),
     'bridge-internal responses stay suppressed'
   );
-  const terminals = frames.filter(
-    (f) => f.type === 'tool_execution_update' && f.toolCallId === 'call_1'
-      && f.partialResult.details.results.every((r) => r.finished === true)
+  assert.equal(
+    frames.filter((f) => f.type === 'tool_execution_end' && f.toolCallId === 'call_1').length,
+    1,
+    'exactly one synthetic card close for the run'
   );
-  assert.equal(terminals.length, 1, 'exactly one terminal subagent update for the run');
   assert.equal(frames.filter((f) => f.type === 'agent_settled').length, 1, 'exactly one settle');
 
   pipeline.stop();
@@ -495,7 +492,8 @@ test('E2E: idle interrupt (paused run) still sweeps subagents before the immedia
 
   const frames = clientLines.getJson();
   const terminalIdx = frames.findIndex(
-    (f) => f.type === 'tool_execution_update' && f.partialResult?.details?.results?.[0]?.stopReason === 'aborted'
+    (f) => f.type === 'tool_execution_end' && f.toolCallId === 'call_1'
+      && f.result?.content?.[0]?.text?.includes('interrupted')
   );
   const settleIdx = frames.findIndex((f) => f.type === 'agent_settled' && f.aborted === true);
   assert.ok(terminalIdx !== -1, 'sweep ran');
@@ -538,37 +536,34 @@ test('E2E: parallel fleet + mid-run interrupt renders exactly the real children 
   childOut.write('{"type":"subagent_progress","payload":{"progress":{"id":"ghost","index":9,"status":"running"}}}\n');
   await new Promise((r) => setImmediate(r));
 
-  // Exactly the real children render, each under its true parent; the
-  // withheld child renders nowhere (no phantom cards).
+  // Exactly the real children render, each inside its true call's status
+  // line; the withheld child renders nowhere.
   let frames = clientLines.getJson();
-  const cardCalls = new Set(
-    frames.filter((f) => f.type === 'tool_execution_update' && f.toolName === 'subagent')
+  const statusCalls = new Set(
+    frames.filter((f) => f.type === 'tool_execution_update' && f.toolName === 'task')
       .map((f) => f.toolCallId)
   );
-  assert.deepEqual([...cardCalls].sort(), ['c1', 'c2', 'c3', 'c4', 'c5'], 'one card parent per real child');
-  const rendered = new Set();
-  for (const f of frames) {
-    if (f.type === 'tool_execution_update' && f.toolName === 'subagent') {
-      for (const r of f.partialResult.details.results) rendered.add(r.agent);
-    }
-  }
-  assert.equal(rendered.size, 5, 'card count equals real-children count');
-  assert.ok(![...rendered].some((a) => a.includes('ghost')), 'the withheld child is unrendered');
+  assert.deepEqual([...statusCalls].sort(), ['c1', 'c2', 'c3', 'c4', 'c5'], 'one status-bearing call per real child');
+  const allText = frames
+    .filter((f) => f.type === 'tool_execution_update' && f.toolName === 'task')
+    .map((f) => f.partialResult.content[0].text)
+    .join('\n');
+  for (let i = 1; i <= 5; i++) assert.ok(allText.includes(`reviewer-${i}`), `reviewer-${i} rendered`);
+  assert.ok(!allText.includes('ghost'), 'the withheld child is unrendered');
 
   // Mid-run interrupt.
   clientIn.write('{"type": "abort"}\n');
   await new Promise((r) => setImmediate(r));
 
-  // Every rendered card reaches a terminal state; no settle jumps ahead.
+  // Every open card closes; no settle jumps ahead.
   frames = clientLines.getJson();
   assert.ok(!frames.some((f) => f.type === 'agent_settled'), 'active-cycle abort waits for agent_end');
-  for (const callId of ['c1', 'c2', 'c3', 'c4', 'c5']) {
-    const terminal = frames.find(
-      (f) => f.type === 'tool_execution_update' && f.toolCallId === callId
-        && f.partialResult.details.results.every((r) => r.finished === true && r.stopReason === 'aborted')
-    );
-    assert.ok(terminal, `${callId} card terminalized within the live window`);
-  }
+  const closedCalls = new Set(
+    frames.filter((f) => f.type === 'tool_execution_end' && f.toolName === 'task'
+      && f.result?.content?.[0]?.text?.includes('interrupted'))
+      .map((f) => f.toolCallId)
+  );
+  assert.deepEqual([...closedCalls].sort(), ['c1', 'c2', 'c3', 'c4', 'c5'], 'every open card closed within the live window');
 
   // Every dispatched child is cancelled - attributed AND withheld - before
   // the abort is forwarded to omp.
@@ -592,14 +587,14 @@ test('E2E: parallel fleet + mid-run interrupt renders exactly the real children 
   assert.equal(frames.filter((f) => f.type === 'agent_settled').length, 1);
   const afterSettle = frames.slice(frames.indexOf(settle) + 1);
   assert.ok(
-    !afterSettle.some((f) => f.type === 'tool_execution_update' && f.partialResult?.details?.results?.some((r) => r.finished === false)),
-    'zero cards still running after the settle'
+    !afterSettle.some((f) => (f.type === 'tool_execution_update' || f.type === 'tool_execution_end') && f.toolName === 'task'),
+    'no task-card frames past finalization'
   );
 
   pipeline.stop();
 });
 
-test('E2E: conflicting-parent completion terminalizes the owner card before the settle', async () => {
+test('E2E: conflicting-parent completion terminalizes the owner line before the settle', async () => {
   const { stdin: clientIn, stdout: clientOut } = createMockStreams();
   const { stdin: childIn, stdout: childOut } = createMockStreams();
   const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
@@ -612,7 +607,7 @@ test('E2E: conflicting-parent completion terminalizes the owner card before the 
   childOut.write('{"type":"agent_start"}\n');
   childOut.write('{"type":"tool_execution_start","toolCallId":"callA","toolName":"task","args":{}}\n');
   childOut.write('{"type":"tool_execution_start","toolCallId":"callB","toolName":"task","args":{}}\n');
-  // 2. child kid running under A - A's card renders running.
+  // 2. child kid running under A - A's line renders running.
   childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callA","id":"kid","index":0,"status":"running","agent":"scout"}}\n');
   // 3. the same child completed with explicit parent B.
   childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callB","id":"kid","index":0,"status":"completed"}}\n');
@@ -624,19 +619,18 @@ test('E2E: conflicting-parent completion terminalizes the owner card before the 
   const frames = clientLines.getJson();
   const ownerUpdateIdx = frames.findIndex(
     (f) => f.type === 'tool_execution_update' && f.toolCallId === 'callA'
-      && f.partialResult.details.results[0]?.finished === true
+      && f.partialResult?.content?.[0]?.text === '1/1 done'
   );
   const settleIdx = frames.findIndex((f) => f.type === 'agent_settled');
-  assert.ok(ownerUpdateIdx !== -1, 'owner card reached its terminal state');
+  assert.ok(ownerUpdateIdx !== -1, 'owner line reached its terminal state');
   assert.ok(settleIdx !== -1);
   assert.ok(ownerUpdateIdx < settleIdx, 'terminal update precedes the settle - no zombie card');
-  const ownerUpdate = frames[ownerUpdateIdx];
-  assert.equal(ownerUpdate.partialResult.details.results[0].stopReason, undefined, 'completed, not aborted');
-  assert.equal(frames.some((f) => f.type === 'tool_execution_update' && f.toolCallId === 'callB'), false, 'no card under the conflicting parent');
+  assert.equal(frames.some((f) => f.type === 'tool_execution_update' && f.toolCallId === 'callB'), false, 'no status line under the conflicting parent');
   const afterSettle = frames.slice(settleIdx + 1);
   assert.ok(
-    !afterSettle.some((f) => f.type === 'tool_execution_update' && f.partialResult?.details?.results?.some((r) => r.finished === false)),
-    'zero running rows past finalization'
+    !afterSettle.some((f) => f.type === 'tool_execution_update' && f.toolName === 'task'
+      && f.partialResult?.content?.[0]?.text?.includes('running:')),
+    'zero running lines past finalization'
   );
 
   pipeline.stop();
