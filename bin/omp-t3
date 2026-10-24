@@ -2,7 +2,7 @@
 'use strict';
 
 const { parseArgs, resolveOmpPath, shimVersionInfo } = require('../src/cli.js');
-const { execSync } = require('node:child_process');
+const { execSync, spawn } = require('node:child_process');
 const { spawnAndProxy } = require('../src/proxy.js');
 const { adaptT3ExtensionArgs, readDeferralLedger } = require('../src/extension_compat.js');
 const { setupSessionSymlink } = require('../src/symlink.js');
@@ -156,14 +156,75 @@ When --mode rpc is received from T3 Code, it is automatically rewritten to --mod
   case 'proxy':
   default: {
     const ompArgs = parsed.ompArgs || ['--mode', 'rpc-ui'];
-    adaptT3ExtensionArgs(ompArgs)
-      .then(({ args, extensionPath }) => {
-        spawnAndProxy(args, extensionPath ? { t3ExtensionPath: extensionPath } : {});
-      })
-      .catch((err) => {
-        console.error(`[omp-t3] Extension adaptation failed (${err && err.message ? err.message : err}); launching without it.`);
-        spawnAndProxy(ompArgs);
-      });
+    const enforced = ompArgs.includes('--tools');
+    const launch = (args) => {
+      adaptT3ExtensionArgs(args)
+        .then(({ args: finalArgs, extensionPath }) => {
+          spawnAndProxy(finalArgs, extensionPath ? { t3ExtensionPath: extensionPath } : {});
+        })
+        .catch((err) => {
+          console.error(`[omp-t3] Extension adaptation failed (${err && err.message ? err.message : err}); launching without it.`);
+          spawnAndProxy(args);
+        });
+    };
+
+    if (enforced) {
+      // Pre-flight prune loop: omp validates --tools immediately and exits
+      // 2, naming the rejected entries (unknown names, or built-ins
+      // unavailable on this host). Each round prunes exactly those names;
+      // a probe that stays up for the cap is valid — kill it and launch.
+      // If the list still fails after the cap, degrade to stock tooling
+      // (policy appendix dropped — partial enforcement beats a dead
+      // provider) and say so on stderr.
+      const { stripInjectedDelegationArgs, resolveOmpPath } = require('../src/cli.js');
+      const ompPath = resolveOmpPath();
+      let args = ompArgs.slice();
+      let round = 0;
+      const pruneStep = (errText) => {
+        const m = errText.match(/(?:Unknown tools in --tools|unavailable in this session): ([^\n]+)/);
+        if (!m) return [];
+        return m[1].split(',').map((s) => s.trim().replace(/\.$/, '')).filter(Boolean);
+      };
+      const pruneList = (names) => {
+        // args = [..., '--tools', '<list>'] — rewrite the list value
+        const idx = args.indexOf('--tools');
+        if (idx === -1 || args[idx + 1] === undefined) return;
+        const kept = args[idx + 1].split(',').filter((t) => !names.includes(t));
+        args[idx + 1] = kept.join(',');
+      };
+      (function run() {
+        round += 1;
+        let stderrBuf = '';
+        const probe = spawn(ompPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        const finish = (ok, errText) => {
+          probe.removeAllListeners('exit');
+          if (!ok) {
+            const names = pruneStep(errText);
+            if (names.length > 0 && round <= 5) {
+              pruneList(names);
+              run();
+              return;
+            }
+            args = stripInjectedDelegationArgs(args);
+            console.error('[omp-t3] Delegation enforcement degraded: omp rejected the injected --tools list on this host (prune loop exhausted). Launching with stock tooling — update omp-t3 for this omp version.');
+          }
+          launch(args);
+        };
+        const timer = setTimeout(() => {
+          probe.removeAllListeners('exit');
+          probe.kill('SIGKILL');
+          finish(true, '');
+        }, 900);
+        let errText = '';
+        probe.stderr && probe.stderr.on('data', (d) => { errText += d; });
+        probe.once('exit', (code) => {
+          clearTimeout(timer);
+          finish(code === 0, errText);
+        });
+      })();
+    } else {
+      launch(ompArgs);
+    }
     break;
   }
 }
