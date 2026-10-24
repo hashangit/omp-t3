@@ -621,12 +621,14 @@ test('FR15: snapshot index disagreement never renumbers an attached child', () =
   assert.equal(bridge.subagentsByCall.get('call_1').get('kid').step, 0, 'step frozen at first attach');
 });
 
-test('FR14: mid-turn attach - explicit parent anchors when no task call was ever seen', () => {
+test('FR14: mid-turn attach - explicit parent anchors in the registry when no task call was ever seen', () => {
   const bridge = new SubagentBridge();
   const res = bridge.handleDownstreamFrame(
     '{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_mid","id":"m1","index":0,"status":"running","agent":"scout"}}'
   );
-  assert.equal(JSON.parse(res.line).toolCallId, 'call_mid', 'no task-call history: the explicit parent anchors');
+  assert.equal(res.line, undefined, 'registry-only adoption renders nothing (P2-1/P2-2 fix)');
+  assert.equal(bridge.childRegistry.get('m1').ownerCallId, 'call_mid', 'the explicit parent anchors');
+  assert.equal(bridge.childRegistry.get('m1').live, true, 'the child stays tracked');
 });
 
 test('FR15: tool-result child at index 5 keeps its step when an event later claims index 0', () => {
@@ -860,21 +862,23 @@ test('FR17: conflicting failed status carries the error outcome to the owner', (
 
 // --- P2-1 repair: unseen explicit parents are adopted, not hijacked ---
 
-test('P2-1: two unseen mid-turn calls each keep their own children and cards', () => {
+test('P2-1: two unseen mid-turn calls each keep their own children (registry-only adoption)', () => {
   const bridge = new SubagentBridge();
   // No task start was ever seen (shim attached mid-turn): two children
   // arrive, each with a DIFFERENT unseen explicit parent.
   const x1 = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callX","id":"X1","index":0,"status":"running","agent":"scout"}}');
-  assert.equal(JSON.parse(x1.line).toolCallId, 'callX');
+  assert.equal(x1.line, undefined, 'adopted calls render nothing (no foreign-card synthesis)');
   const y1 = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callY","id":"Y1","index":0,"status":"running","agent":"auditor"}}');
-  assert.equal(JSON.parse(y1.line).toolCallId, 'callY', 'second unseen call must NOT hijack into the first');
-  assert.equal(bridge.childRegistry.get('Y1').ownerCallId, 'callY');
+  assert.equal(y1.line, undefined, 'second unseen call must NOT hijack into the first');
+  assert.equal(bridge.childRegistry.get('X1').ownerCallId, 'callX');
+  assert.equal(bridge.childRegistry.get('Y1').ownerCallId, 'callY', 'second unseen call anchors to its own parent');
   assert.equal(bridge.subagentsByCall.get('callY').get('Y1').agent, 'auditor');
 
-  // The interrupt closes BOTH cards and cancels both children.
+  // The interrupt cancels both children by id; no synthetic card surgery
+  // lands on calls T3 may not even hold (P2-1/P2-2 fix).
   const sweep = bridge.abortSweep();
   assert.deepEqual(sweep.toOmp.map((l) => JSON.parse(l).subagentId).sort(), ['X1', 'Y1']);
-  assert.deepEqual(sweep.toClient.map((l) => JSON.parse(l).toolCallId).sort(), ['callX', 'callY']);
+  assert.deepEqual(sweep.toClient, [], 'adopted calls have no bridge-rendered cards to close');
 });
 
 test('P2-1: a late parentless follow-up from a second-call child follows its true parent', () => {
@@ -883,8 +887,9 @@ test('P2-1: a late parentless follow-up from a second-call child follows its tru
   bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"callY","id":"Y1","index":0,"status":"running"}}');
   // Parentless completion of the SECOND call's child: registry owner wins.
   const res = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"id":"Y1","index":0,"status":"completed"}}');
-  assert.equal(JSON.parse(res.line).toolCallId, 'callY');
-  assert.equal(JSON.parse(res.line).partialResult.content[0].text, '1/1 done');
+  assert.equal(res.line, undefined, 'adopted calls render nothing');
+  assert.equal(bridge.childRegistry.get('Y1').ownerCallId, 'callY', 'registry owner wins over call history');
+  assert.equal(bridge.childRegistry.get('Y1').finished, true);
 });
 
 test('distrusted parent: an explicit parent seen as a non-task tool is never adopted', () => {

@@ -60,6 +60,13 @@ function createProxyPipeline(options) {
   };
   // Post-abort cancellation window: children that surface AFTER the sweep
   // are cancelled the moment the bridge observes them (direct omp write).
+  // A write after omp's stdin ended emits a stream error: observe it once
+  // so a late window-cancel can never kill the shim.
+  if (typeof childIn.on === 'function') {
+    childIn.on('error', (err) => {
+      console.error(`[omp-t3] omp stdin write failed (window cancel or late frame): ${err.message}`);
+    });
+  }
   subagentBridge.onOmpLine = (line) => childIn.write(line);
   // Reconciliation against omp's authoritative live child list
   // (get_subagents): heals missed events and refreshes card details.
@@ -92,17 +99,18 @@ function createProxyPipeline(options) {
       if (upstreamResult && upstreamResult.emit) {
         clientOut.write(upstreamResult.emit);
       }
-      // A new turn disarms the post-abort cancellation window: children
-      // spawned for THIS prompt are legitimate work, not stragglers of the
-      // interrupted run. Must run after handleUpstreamFrame so the sweep
-      // (on abort/abort_and_prompt) arms before the disarming prompt.
-      if (
-        trimmed.includes('"type":"prompt"') ||
-        trimmed.includes('"type": "prompt"') ||
-        trimmed.includes('"type":"abort_and_prompt"') ||
-        trimmed.includes('"type": "abort_and_prompt"')
-      ) {
+      // A plain prompt starts a fresh turn: disarm the post-abort
+      // cancellation window (children spawned for THIS prompt are
+      // legitimate work). abort_and_prompt instead arms a short
+      // self-expiring window: the sweep (via handleUpstreamFrame above)
+      // armed it indefinitely, and old-run stragglers surfacing within the
+      // window are cancelled — while the new turn's own children spawn
+      // after model latency, past the expiry. Runs after
+      // handleUpstreamFrame so the sweep arms before any expiry override.
+      if (/"type":\s*"prompt"/.test(trimmed)) {
         subagentBridge.disarmAbort();
+      } else if (/"type":\s*"abort_and_prompt"/.test(trimmed)) {
+        subagentBridge.armTimedCancelWindow();
       }
 
       // 2. Intercept get_available_models
