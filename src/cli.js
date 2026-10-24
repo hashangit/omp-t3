@@ -94,15 +94,15 @@ function parseArgs(argv) {
       // An explicit tools list wins: the user scoped the toolset, we keep it.
       toolsFound = true;
       rewritten.push(arg);
+      if (arg === '--tools' && i + 1 < argv.length) rewritten.push(argv[++i]);
     } else if (arg === '--append-system-prompt' || arg.startsWith('--append-system-prompt=')) {
-      // A user-provided prompt appendix is preserved and merged with ours.
+      // Preserve the original appendix for opt-out and validation fallback.
       appendPromptFound = true;
       if (arg === '--append-system-prompt') {
-        const value = argv[i + 1];
-        rewritten.push('--append-system-prompt', `${value ?? ''}\n\n${DELEGATION_POLICY}`);
-        i++; // skip next arg
+        rewritten.push(arg);
+        if (i + 1 < argv.length) rewritten.push(argv[++i]);
       } else {
-        rewritten.push(`--append-system-prompt=${arg.slice('--append-system-prompt='.length)}\n\n${DELEGATION_POLICY}`);
+        rewritten.push(arg);
       }
     } else {
       rewritten.push(arg);
@@ -120,23 +120,34 @@ function parseArgs(argv) {
   // appended to the system prompt, so delegated/subagent work goes through
   // T3's delegate_task MCP tool (isolated, openable child threads). See
   // README "Delegation enforcement".
-  const delegateMode = process.env.OMPT3_DELEGATE_TASKS !== '0';
-  if (delegateMode) {
-    if (!toolsFound) {
-      rewritten.push('--tools', DEFAULT_TOOLS.join(','));
-    }
+  const fallbackArgs = rewritten.slice();
+  const injectedTools = process.env.OMPT3_DELEGATE_TASKS !== '0' && !toolsFound;
+  if (injectedTools) {
+    rewritten.push('--tools', DEFAULT_TOOLS.join(','));
     if (!appendPromptFound) {
       rewritten.push('--append-system-prompt', DELEGATION_POLICY);
+    } else {
+      for (let i = 0; i < rewritten.length; i++) {
+        if (rewritten[i] === '--append-system-prompt') {
+          rewritten[i + 1] = `${rewritten[i + 1] ?? ''}\n\n${DELEGATION_POLICY}`;
+          i++;
+        } else if (rewritten[i].startsWith('--append-system-prompt=')) {
+          rewritten[i] += `\n\n${DELEGATION_POLICY}`;
+        }
+      }
     }
   }
 
   // Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS). Without the env
-  // var this pushes nothing — the spawned argv stays byte-identical.
-  rewritten.push(...subagentCapArgs(process.env.OMPT3_MAX_SUBAGENTS));
+  // var this adds nothing to either launch path.
+  const capArgs = subagentCapArgs(process.env.OMPT3_MAX_SUBAGENTS);
+  rewritten.push(...capArgs);
+  fallbackArgs.push(...capArgs);
 
   return {
     action: 'proxy',
-    ompArgs: rewritten
+    ompArgs: rewritten,
+    delegation: { injectedTools, fallbackArgs }
   };
 }
 
@@ -204,32 +215,6 @@ function subagentCapArgs(rawValue) {
 }
 
 /**
- * Removes the flags this shim injects for delegation enforcement (the
- * --tools pair and any --append-system-prompt[=value]) from omp argv.
- * Used by the launch pre-flight: if omp rejects the injected tool list,
- * the launch degrades to stock tooling (policy appendix dropped too —
- * partial enforcement beats a dead provider).
- * @param {string[]} ompArgs
- * @returns {string[]} sanitized argv
- */
-function stripInjectedDelegationArgs(ompArgs) {
-  const out = [];
-  for (let i = 0; i < ompArgs.length; i++) {
-    const arg = ompArgs[i];
-    if (arg === '--tools' || arg.startsWith('--tools=')) {
-      if (arg === '--tools') i++; // skip the list value
-      continue;
-    }
-    if (arg === '--append-system-prompt' || arg.startsWith('--append-system-prompt=')) {
-      if (arg === '--append-system-prompt') i++; // skip the policy value
-      continue;
-    }
-    out.push(arg);
-  }
-  return out;
-}
-
-/**
  * Resolves the path to the real omp executable.
  * @returns {string} Absolute path to omp binary
  */
@@ -290,7 +275,6 @@ module.exports = {
   shimVersionInfo,
   subagentOverlayPath,
   subagentCapArgs,
-  stripInjectedDelegationArgs,
   DEFAULT_TOOLS,
   DELEGATION_POLICY
 };

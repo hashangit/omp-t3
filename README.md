@@ -138,9 +138,19 @@ What happens: the shim atomically writes `~/.cache/omp-t3/subagent-limits-<N>.ym
 
 Long-running delegated work does not belong in native subagents at all: per [AGENTS.md §Subagents](AGENTS.md), use T3's `delegate_task` MCP tool — those children run as T3-owned threads (openable in T3's UI, outside omp's heap) instead of in-process cards.
 
+## Delegation enforcement
+
+By default, `omp-t3` supplies a built-in tool list that excludes OMP's in-process `task` spawner. It appends a system-prompt policy directing delegated work to T3's `delegate_task` MCP tool, where children run in separate, openable threads. The shim removes the native spawner; T3 owns scheduling of delegated threads. `OMPT3_MAX_SUBAGENTS` limits OMP's native tasks only and does not cap T3 `delegate_task` children.
+
+Set `OMPT3_DELEGATE_TASKS=0` to restore stock tooling and preserve user prompt appendices unchanged. An explicit `--tools` list, in either CLI form, also takes precedence and bypasses the shim's tool validation and policy injection. Explicit lists are passed to OMP unchanged, including any validation errors.
+
+For shim-supplied lists, a startup probe waits up to five seconds for OMP's `ready` frame. OMP's singular or plural unknown-tool errors and unavailable-tool errors prune only the named entries, with at most five probes. A timeout, spawn failure, unrecognized error, or empty remaining list falls back to stock tooling with a stderr warning. Fallback preserves the original user arguments, prompt appendix, and concurrency overlay. This fallback restores the native `task` tool, so delegation enforcement is unavailable for that launch.
+
+The probe starts OMP with the launch arguments and agent directory, so configured extensions and MCP servers may initialize during validation as well as during the final launch. Each probe uses its own process group on Unix, which is terminated before the next launch. A `ready` frame validates startup; it does not guarantee model credentials, quotas, or subsequent requests will succeed.
+
 ## CLI
 
-`omp-t3` handles four helper flags plus the `update` subcommand locally; everything else is forwarded to `omp` untouched (only `--mode rpc` is rewritten to `--mode rpc-ui`, and `OMPT3_MAX_SUBAGENTS` opt-in adds one `--config` overlay — see [Limiting concurrent subagents](#limiting-concurrent-subagents)):
+`omp-t3` handles four helper flags plus the `update` subcommand locally. It rewrites `--mode` to `rpc-ui`, applies [delegation enforcement](#delegation-enforcement) by default, and optionally adds the `OMPT3_MAX_SUBAGENTS` config overlay. Other arguments pass through to OMP:
 
 | Command | Behavior |
 |---|---|
@@ -175,6 +185,7 @@ npm test
 
 ### Unreleased (1.4.0-3)
 
+- Default launches disable native `task` and route delegation to T3. Startup validation prunes rejected built-ins, waits for `ready`, and preserves user arguments on fallback. `OMPT3_DELEGATE_TASKS=0` and explicit `--tools` lists bypass this behavior. See [Delegation enforcement](#delegation-enforcement).
 - **Adoption is registry-only.** Task calls the bridge never saw start (mid-turn attach, missed start frames) are adopted for attribution, registry cancellation, and hold-open bookkeeping only — no synthetic status/end frames are emitted onto an id T3 may not hold a card for. This fixes two defects introduced by the previous iteration's open-call adoption: a live status card adopted onto an already-cancelled child after the interrupt (zombie window), and an unseen active bash/wait tool being adopted as a task call, which pointed synthetic card frames at a real, unrelated tool card. Adopted ids are tracked in a separate set and can never capture parentless frames via the sole-task-call fallback. **Recorded trade-off:** mid-turn-attached children no longer render live status lines — they remain tracked, counted toward hold-open notices, and are cancelled at interrupt.
 - **Cancellation window is provenance-scoped.** After an interrupt (`abort` or the combined `abort_and_prompt`), the sweep records every task-call id known at that moment; while the window is armed (until the next plain prompt), only children belonging to those pre-interrupt calls — with proven ownership — are cancelled on observation. Children of calls opened or adopted after the abort are never cancelled: adoption is not proof of age, and killing a new-turn child is worse than letting a rare old-run straggler finish (it stays tracked, counted toward hold-open, and reconciled post-settle). This fixes the previous iteration's silent no-op on `abort_and_prompt` without re-introducing over-cancellation. A proxy-layer pin drives the seam end-to-end: armed-window stragglers are cancelled, and the same provenance is spared after the prompt disarms.
 - **Hygiene:** unpredictable overlay `.tmp` names with cleanup on every failure path; `childIn` stream error listener so a late window-cancel can never kill the shim; `resolveCallId`/`adoptUnseenCall` doc blocks rewritten to the current trust rule; README historical entries reworded. (The `Number.isSafeInteger` cap guard ships in 1.4.0-2, not here.)

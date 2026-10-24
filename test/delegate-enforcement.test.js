@@ -76,3 +76,27 @@ test('enforcement: composes with the concurrency cap and mode rewrite', () => {
     delete process.env.OMPT3_MAX_SUBAGENTS;
   }
 });
+
+
+test('enforcement: opt-out preserves user appendices in both forms', () => {
+  process.env.OMPT3_DELEGATE_TASKS = '0';
+  try {
+    for (const flags of [['--append-system-prompt','USER RULE'],['--append-system-prompt=USER RULE']]) {
+      const {ompArgs, delegation}=parseArgs(['--mode','rpc',...flags]);
+      assert.deepEqual(ompArgs,['--mode','rpc-ui',...flags]);
+      assert.equal(delegation.injectedTools,false);
+    }
+  } finally { delete process.env.OMPT3_DELEGATE_TASKS; }
+});
+
+test('enforcement: fallback keeps user prompt, session flags and cap overlay', () => {
+  process.env.OMPT3_MAX_SUBAGENTS='2';
+  try {
+    const {ompArgs,delegation}=parseArgs(['--mode','rpc','--session','session.jsonl','--append-system-prompt','USER RULE']);
+    assert.equal(delegation.injectedTools,true);
+    assert.ok(ompArgs.some(a=>a.includes('Delegation policy')));
+    assert.deepEqual(delegation.fallbackArgs.slice(0,6),['--mode','rpc-ui','--session','session.jsonl','--append-system-prompt','USER RULE']);
+    assert.deepEqual(delegation.fallbackArgs.slice(-2),ompArgs.slice(-2));
+    assert.equal(delegation.fallbackArgs.at(-2),'--config');
+  } finally { delete process.env.OMPT3_MAX_SUBAGENTS; }
+});
