@@ -504,6 +504,48 @@ test('E2E: idle interrupt (paused run) still sweeps subagents before the immedia
   pipeline.stop();
 });
 
+test('E2E: disarm seam — a plain prompt after an abort closes the cancellation window', async () => {
+  const { stdin: clientIn, stdout: clientOut } = createMockStreams();
+  const { stdin: childIn, stdout: childOut } = createMockStreams();
+  const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
+  const clientLines = collectLines(clientOut);
+  const childLines = collectLines(childIn);
+  pipeline.start();
+
+  // Interrupt an idle turn: sweep arms the window (no children yet).
+  clientIn.write('{"type": "abort"}\n');
+  await new Promise((r) => setImmediate(r));
+  assert.ok(
+    clientLines.getJson().some((f) => f.type === 'agent_settled' && f.aborted === true),
+    'idle abort settles'
+  );
+
+  // New turn: a task call opens and a child reports. The call started
+  // AFTER the abort, so it is post-abort work: its children are never
+  // window-cancelled (provenance rule), and the run settles as before.
+  childOut.write('{"type":"tool_execution_start","toolCallId":"c1","toolName":"task","args":{}}\n');
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c1","id":"kid","index":0,"status":"running","agent":"scout"}}\n');
+  await new Promise((r) => setImmediate(r));
+  const kidCancels = childLines.getJson().filter(
+    (f) => f.type === 'cancel_subagent' && f.subagentId === 'kid'
+  );
+  assert.equal(kidCancels.length, 0, 'post-abort calls spawn new work: never window-cancelled');
+
+  // The plain prompt disarms the window: new-turn children spawn freely.
+  clientIn.write('{"type":"prompt","message":"go"}\n');
+  childOut.write('{"type":"agent_start"}\n');
+  childOut.write('{"type":"tool_execution_start","toolCallId":"c2","toolName":"task","args":{}}\n');
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c2","id":"fresh","index":0,"status":"running","agent":"worker"}}\n');
+  await new Promise((r) => setImmediate(r));
+
+  const cancelsAfterDisarm = childLines.getJson().filter(
+    (f) => f.type === 'cancel_subagent' && f.subagentId === 'fresh'
+  );
+  assert.equal(cancelsAfterDisarm.length, 0, 'disarmed: the new-turn child is never cancelled');
+
+  pipeline.stop();
+});
+
 test('E2E: parallel fleet + mid-run interrupt renders exactly the real children and cancels the withheld ones', async () => {
   const { stdin: clientIn, stdout: clientOut } = createMockStreams();
   const { stdin: childIn, stdout: childOut } = createMockStreams();

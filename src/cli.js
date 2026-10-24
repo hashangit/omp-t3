@@ -104,7 +104,8 @@ function subagentOverlayPath(max) {
  * OOM-killed long fan-out sessions.
  *
  * Returns [] unless `rawValue` is a plain decimal positive integer
- * (`/^\d+$/` — no `0x10`, no `1e3`, no padded whitespace) — every default
+ * (`/^\d+$/` — no `0x10`, no `1e3`, no padded whitespace) that also fits
+ * in a safe integer — every default
  * launch (and every invalid value, warned about on stderr with the value
  * control-character-sanitized) injects nothing. The overlay is written
  * atomically (temp + rename, so a concurrent reader never sees a torn
