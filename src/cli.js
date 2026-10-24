@@ -8,6 +8,33 @@ const { execSync } = require('node:child_process');
 const pkg = require('../package.json');
 
 /**
+ * Built-in tools enabled for T3-mediated sessions when delegation
+ * enforcement is on (default): omp's full default set (read, bash, edit,
+ * write, grep, glob, lsp, python, notebook, browser, todo, web_search,
+ * ask) MINUS `task` — the in-process subagent spawner. `computer` stays
+ * excluded (disabled by default in omp). Version-pinned against the
+ * supported omp releases; update when a supported release adds a tool.
+ */
+const DEFAULT_TOOLS = [
+  'read', 'bash', 'edit', 'write', 'grep', 'glob', 'lsp', 'python',
+  'notebook', 'browser', 'todo', 'web_search', 'ask'
+];
+
+/**
+ * System-prompt appendix injected with delegation enforcement: routes
+ * subagent-shaped work to T3's delegate_task MCP tool (isolated, openable
+ * child threads) instead of the removed in-process path.
+ */
+const DELEGATION_POLICY = [
+  '## Delegation policy (this session runs inside T3 Code)',
+  '',
+  'In-process subagents are disabled in this session. When the user asks for subagents, delegates, reviewers, or parallel workers — or when a task is large enough to delegate — use the T3 `delegate_task` MCP tool.',
+  'Each delegation becomes an isolated, openable T3 thread with its own provider scope; results return to this thread automatically.',
+  'Do your own quick, direct work (reads, searches, edits, short commands) with your regular tools instead of delegating.',
+  'Do not attempt to use an in-process `task`-style subagent tool: it is intentionally unavailable here.'
+].join('\n');
+
+/**
  * Parses incoming CLI arguments and translates them for OMP execution.
  * @param {string[]} argv Raw argv slice (e.g. process.argv.slice(2))
  * @returns {{ action: string, ompArgs?: string[], options?: Record<string, any> }}
@@ -46,6 +73,8 @@ function parseArgs(argv) {
   // Rewrite arguments for OMP execution
   const rewritten = [];
   let modeFound = false;
+  let toolsFound = false;
+  let appendPromptFound = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -60,6 +89,20 @@ function parseArgs(argv) {
     } else if (arg.startsWith('--mode=')) {
       modeFound = true;
       rewritten.push('--mode=rpc-ui');
+    } else if (arg === '--tools' || arg.startsWith('--tools=')) {
+      // An explicit tools list wins: the user scoped the toolset, we keep it.
+      toolsFound = true;
+      rewritten.push(arg);
+    } else if (arg === '--append-system-prompt' || arg.startsWith('--append-system-prompt=')) {
+      // A user-provided prompt appendix is preserved and merged with ours.
+      appendPromptFound = true;
+      if (arg === '--append-system-prompt') {
+        const value = argv[i + 1];
+        rewritten.push('--append-system-prompt', `${value ?? ''}\n\n${DELEGATION_POLICY}`);
+        i++; // skip next arg
+      } else {
+        rewritten.push(`--append-system-prompt=${arg.slice('--append-system-prompt='.length)}\n\n${DELEGATION_POLICY}`);
+      }
     } else {
       rewritten.push(arg);
     }
@@ -68,6 +111,22 @@ function parseArgs(argv) {
   // If no --mode was specified at all, default to rpc-ui
   if (!modeFound) {
     rewritten.unshift('--mode', 'rpc-ui');
+  }
+
+  // Delegate-enforcement (default on; OMPT3_DELEGATE_TASKS=0 opts out).
+  // T3-mediated sessions must not spawn in-process subagents: the native
+  // `task` tool is removed from the enabled set and the routing policy is
+  // appended to the system prompt, so delegated/subagent work goes through
+  // T3's delegate_task MCP tool (isolated, openable child threads). See
+  // README "Delegation enforcement".
+  const delegateMode = process.env.OMPT3_DELEGATE_TASKS !== '0';
+  if (delegateMode) {
+    if (!toolsFound) {
+      rewritten.push('--tools', DEFAULT_TOOLS.join(','));
+    }
+    if (!appendPromptFound) {
+      rewritten.push('--append-system-prompt', DELEGATION_POLICY);
+    }
   }
 
   // Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS). Without the env
