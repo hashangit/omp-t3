@@ -127,14 +127,16 @@ The check verifies that:
 
 ### Limiting concurrent subagents
 
-Each omp subagent is an in-process async task sharing omp's single V8 heap. Long fan-out fleets (6+ concurrent reviewers with large transcripts) can exhaust that heap and `SIGABRT` the whole provider scope — capping live children bounds the peak. To run T3-mediated sessions at most 2 subagents at a time:
+Each omp subagent is an in-process async task sharing omp's single V8 heap. Long fan-out fleets (6+ concurrent reviewers with large transcripts) can exhaust that heap and `SIGABRT` the whole provider scope — capping live children bounds the peak. Native `task` subagents are meant for short parallel work, so the recommended cap is 5:
 
 ```bash
 # In the environment the T3-launched shim inherits (e.g. a wrapper):
-OMPT3_MAX_SUBAGENTS=2 omp-t3   # exec omp-t3 "$@" for a passthrough wrapper
+OMPT3_MAX_SUBAGENTS=5 omp-t3   # exec omp-t3 "$@" for a passthrough wrapper
 ```
 
-What happens: the shim writes `~/.cache/omp-t3/subagent-limits.yml` and adds `--config <that file>` to the omp launch. omp queues the 3rd+ concurrent `task` spawn (T3 needs no change — queued children simply open their cards later, and hold-open counts stay truthful) and tells the model "Max 2 concurrent subagents; excess queue." in its system prompt, so disciplined leads dispatch in waves without hitting the queue. The cap is per-omp-session, not machine-wide: your direct `omp` terminals keep their own setting.
+What happens: the shim writes `~/.cache/omp-t3/subagent-limits.yml` and adds `--config <that file>` to the omp launch. omp queues the 6th+ concurrent `task` spawn (T3 needs no change — queued children simply open their cards later, and hold-open counts stay truthful) and tells the model "Max 5 concurrent subagents; excess queue." in its system prompt, so disciplined leads dispatch in waves without hitting the queue. The cap is per-omp-session, not machine-wide: your direct `omp` terminals keep their own setting.
+
+Long-running delegated work does not belong in native subagents at all: per [AGENTS.md §Subagents](AGENTS.md), use T3's `delegate_task` MCP tool — those children run as T3-owned threads (openable in T3's UI, outside omp's heap) instead of in-process cards.
 
 ## CLI
 

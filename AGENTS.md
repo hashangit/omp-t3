@@ -15,3 +15,7 @@ Edit the canonical copies in `.agents/skills/` only — every agent-specific dir
 - **Release (wired 2026-10-23)**: `.github/workflows/release.yml` triggers on `vX.Y.Z` tags (plain semver only — the prerelease `1.3.0-N` scheme ended with 1.3.0-6; 1.4.0 onward is plain `X.Y.Z`). The workflow runs the gates on the tagged source, requires a `Reviews/*-gatekeeper-RELEASE.md` PASS receipt sealed to the release commit's parent, and creates the GitHub Release from the committed `RELEASE_NOTES-vX.Y.Z.md`. npm publishing and the Homebrew tap (`hashangit/homebrew-omp-t3`, formula pulls the npm tarball) stay manual steps performed by the owner. The gate on a clean, committed HEAD still precedes any push, bump, or tag.
 
 See `.agents/skills/gatekeeper/SKILL.md` for the router and its `references/setup.md` for configuration rules.
+
+## Subagents
+
+For long-running delegated tasks, use T3's `delegate_task` MCP tool (target `providerInstanceId: "pi"`) instead of the native `task` tool so child sessions are created as openable T3 threads.
