@@ -209,14 +209,9 @@ class SubagentBridge {
       } else {
         // Started non-task tool (wait/bash/...): an explicit parent pointing
         // here is a distrusted late-event misattribution (see resolveCallId).
-        // Bound the set without a full wipe: keep the most recent 2000 ids
-        // (Sets preserve insertion order), recent ones are the plausible
-        // parents anyway.
-        if (this.nonTaskCalls.size > 4000) {
-          const keep = [...this.nonTaskCalls].slice(-2000);
-          this.nonTaskCalls.clear();
-          for (const id of keep) this.nonTaskCalls.add(id);
-        }
+        // Unbounded by design: evicting an id would expire its distrust and
+        // let a late wait/bash parent be adopted as a task call (R2 P2-2).
+        // Entries are small; session-length growth is acceptable.
         this.nonTaskCalls.add(parsed.toolCallId);
       }
     }
@@ -643,13 +638,18 @@ class SubagentBridge {
     rec.live = rec.finished === true ? false : observation.live;
     // Post-abort cancellation window, provenance-scoped: a child surfacing
     // after the sweep is cancelled on observation ONLY when its owner is a
-    // pre-abort call (a straggler of the interrupted run). Children of
-    // calls opened after the abort — the new turn's own spawns, adopted or
-    // not — never match the snapshot and are never touched. Unattributed
-    // children have no provable owner and are left to reconciliation.
+    // pre-abort call (a straggler of the interrupted run) or a call adopted
+    // while the window was armed (an unseen-parent straggler — adoption
+    // during the window is itself proof the child predates the abort).
+    // Children of calls opened after the abort — the new turn's own spawns —
+    // never match. Known residual: a straggler that arrives ownerless AND
+    // is never attributed is left to reconciliation, not window-cancelled.
     if (
       this.abortArmed && rec.live === true && rec.ownerCallId !== null
-      && this.preAbortCalls !== null && this.preAbortCalls.has(rec.ownerCallId)
+      && (
+        (this.preAbortCalls !== null && this.preAbortCalls.has(rec.ownerCallId))
+        || this.adoptedCalls.has(rec.ownerCallId)
+      )
     ) {
       rec.live = false;
       rec.finished = true;

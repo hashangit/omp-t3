@@ -89,15 +89,10 @@ class SettlementTracker {
         }) + '\n'
       };
     }
-    if (line.includes('"type":"prompt"') || line.includes('"type": "prompt"')) {
+    if (/"type":\s*"prompt"/.test(line)) {
       this.lastPromptStatus = null;
       this.sawCycleThisTurn = false;
-    } else if (
-      line.includes('"type":"abort"') ||
-      line.includes('"type": "abort"') ||
-      line.includes('"type":"abort_and_prompt"') ||
-      line.includes('"type": "abort_and_prompt"')
-    ) {
+    } else if (/"type":\s*"abort(_and_prompt)?"/.test(line)) {
       this.lastPromptStatus = 'aborted';
       this.sawAbort = true;
       // Subagent stop translation must land while T3's turn is still
