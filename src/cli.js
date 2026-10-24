@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
 const pkg = require('../package.json');
@@ -68,10 +69,71 @@ function parseArgs(argv) {
     rewritten.unshift('--mode', 'rpc-ui');
   }
 
+  // Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS). Without the env
+  // var this pushes nothing — the spawned argv stays byte-identical.
+  rewritten.push(...subagentCapArgs(process.env.OMPT3_MAX_SUBAGENTS));
+
   return {
     action: 'proxy',
     ompArgs: rewritten
   };
+}
+
+/**
+ * Cache path for the shim-managed subagent-concurrency overlay, keyed by
+ * the cap value: concurrent shims with the same cap share one immutable
+ * file (no last-writer-wins), different caps get different files.
+ */
+function subagentOverlayPath(max) {
+  const cacheDir = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+  return path.join(cacheDir, 'omp-t3', `subagent-limits-${max}.yml`);
+}
+
+/**
+ * Builds the extra omp argv for the opt-in subagent concurrency cap.
+ *
+ * omp natively enforces `task.maxConcurrency` — its task-tool semaphore
+ * queues excess spawns until a slot frees — and derives the
+ * "Max N concurrent subagents; excess queue." line of its own system
+ * prompt from the same setting (live-verified against omp 18.12.3: an
+ * overlay with maxConcurrency 2 made the model quote that exact line).
+ * One repeatable `--config` overlay therefore both enforces the cap and
+ * tells the lead agent about it; subagents are in-process tasks sharing
+ * omp's single V8 heap, so bounding live children bounds the peak that
+ * OOM-killed long fan-out sessions.
+ *
+ * Returns [] unless `rawValue` is a plain decimal positive integer
+ * (`/^\d+$/` — no `0x10`, no `1e3`, no padded whitespace) — every default
+ * launch (and every invalid value, warned about on stderr with the value
+ * control-character-sanitized) injects nothing. The overlay is written
+ * atomically (temp + rename, so a concurrent reader never sees a torn
+ * file and a pre-existing symlink at the target is replaced, not
+ * followed); if the cache dir is unwritable the shim warns and launches
+ * WITHOUT the cap rather than dying — availability over enforcement.
+ * `--config` is repeatable in omp, so this never collides with
+ * user-passed overlays.
+ * @param {string|undefined} rawValue process.env.OMPT3_MAX_SUBAGENTS
+ * @returns {string[]} argv items to append ('--config', <path>)
+ */
+function subagentCapArgs(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') return [];
+  if (!/^\d+$/.test(rawValue) || Number(rawValue) < 1) {
+    const shown = String(rawValue).replace(/[\u0000-\u001f\u007f]/g, '?');
+    console.error(`[omp-t3] Ignoring OMPT3_MAX_SUBAGENTS='${shown}': expected a plain positive integer (e.g. 5).`);
+    return [];
+  }
+  const max = Number(rawValue);
+  try {
+    const overlayPath = subagentOverlayPath(max);
+    fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
+    const tmp = `${overlayPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `task:\n  maxConcurrency: ${max}\n`);
+    fs.renameSync(tmp, overlayPath);
+    return ['--config', overlayPath];
+  } catch (err) {
+    console.error(`[omp-t3] OMPT3_MAX_SUBAGENTS=${max} ignored: cannot write the config overlay (${err.message}); launching without the cap.`);
+    return [];
+  }
 }
 
 /**
@@ -132,5 +194,7 @@ function shimVersionInfo(version = pkg.version) {
 module.exports = {
   parseArgs,
   resolveOmpPath,
-  shimVersionInfo
+  shimVersionInfo,
+  subagentOverlayPath,
+  subagentCapArgs
 };
