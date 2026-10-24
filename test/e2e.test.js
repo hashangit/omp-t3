@@ -504,7 +504,7 @@ test('E2E: idle interrupt (paused run) still sweeps subagents before the immedia
   pipeline.stop();
 });
 
-test('E2E: disarm seam — a plain prompt after an abort closes the cancellation window', async () => {
+test('E2E: disarm seam — the window cancels pre-abort stragglers until a plain prompt disarms it', async () => {
   const { stdin: clientIn, stdout: clientOut } = createMockStreams();
   const { stdin: childIn, stdout: childOut } = createMockStreams();
   const pipeline = createProxyPipeline({ clientIn, clientOut, childIn, childOut });
@@ -512,36 +512,42 @@ test('E2E: disarm seam — a plain prompt after an abort closes the cancellation
   const childLines = collectLines(childIn);
   pipeline.start();
 
-  // Interrupt an idle turn: sweep arms the window (no children yet).
+  // A task call with a running child, then the interrupt: the sweep
+  // cancels the tracked child and arms the window with c0 in its
+  // provenance snapshot (this is what makes the seam observable — the
+  // snapshot is non-empty, so arm state changes the outcome).
+  childOut.write('{"type":"tool_execution_start","toolCallId":"c0","toolName":"task","args":{}}\n');
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c0","id":"r1","index":0,"status":"running","agent":"scout"}}\n');
+  await new Promise((r) => setImmediate(r));
+
   clientIn.write('{"type": "abort"}\n');
   await new Promise((r) => setImmediate(r));
   assert.ok(
-    clientLines.getJson().some((f) => f.type === 'agent_settled' && f.aborted === true),
-    'idle abort settles'
+    childLines.getJson().some((f) => f.type === 'cancel_subagent' && f.subagentId === 'r1'),
+    'armed window cancels the tracked child at interrupt'
   );
 
-  // New turn: a task call opens and a child reports. The call started
-  // AFTER the abort, so it is post-abort work: its children are never
-  // window-cancelled (provenance rule), and the run settles as before.
-  childOut.write('{"type":"tool_execution_start","toolCallId":"c1","toolName":"task","args":{}}\n');
-  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c1","id":"kid","index":0,"status":"running","agent":"scout"}}\n');
+  // While STILL armed: a straggler of the same pre-abort call is
+  // window-cancelled on observation.
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c0","id":"r2","index":0,"status":"running","agent":"scout"}}\n');
   await new Promise((r) => setImmediate(r));
-  const kidCancels = childLines.getJson().filter(
-    (f) => f.type === 'cancel_subagent' && f.subagentId === 'kid'
+  assert.ok(
+    childLines.getJson().some((f) => f.type === 'cancel_subagent' && f.subagentId === 'r2'),
+    'armed window cancels a pre-abort straggler'
   );
-  assert.equal(kidCancels.length, 0, 'post-abort calls spawn new work: never window-cancelled');
 
-  // The plain prompt disarms the window: new-turn children spawn freely.
-  clientIn.write('{"type":"prompt","message":"go"}\n');
-  childOut.write('{"type":"agent_start"}\n');
-  childOut.write('{"type":"tool_execution_start","toolCallId":"c2","toolName":"task","args":{}}\n');
-  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c2","id":"fresh","index":0,"status":"running","agent":"worker"}}\n');
+  // The plain prompt disarms the window: a later straggler of the same
+  // call is left alone. This is the seam — same provenance, only the arm
+  // state changed, so this pin fails if the disarm goes missing.
+  clientIn.write('{"type":"prompt","message":"continue"}\n');
+  await new Promise((r) => setImmediate(r));
+  childOut.write('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c0","id":"r3","index":0,"status":"running","agent":"scout"}}\n');
   await new Promise((r) => setImmediate(r));
 
-  const cancelsAfterDisarm = childLines.getJson().filter(
-    (f) => f.type === 'cancel_subagent' && f.subagentId === 'fresh'
+  const r3Cancels = childLines.getJson().filter(
+    (f) => f.type === 'cancel_subagent' && f.subagentId === 'r3'
   );
-  assert.equal(cancelsAfterDisarm.length, 0, 'disarmed: the new-turn child is never cancelled');
+  assert.equal(r3Cancels.length, 0, 'disarmed: post-prompt stragglers are never cancelled');
 
   pipeline.stop();
 });

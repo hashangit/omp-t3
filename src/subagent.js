@@ -101,16 +101,18 @@ class SubagentBridge {
     // Task call ids adopted without a seen start (mid-turn attach, missed
     // start frames): attribution + pendingCount + cancellation only, never
     // rendering, never counted by rule 3's sole-task-call fallback.
+    // Unbounded by design (same trade as nonTaskCalls — small entries,
+    // session-scoped); hostile/compromised omp could grow it, accepted.
     this.adoptedCalls = new Set();
     // Post-abort cancellation window (provenance-scoped). Plain abort or
     // abort_and_prompt: the sweep snapshots every task-call id known at
     // abort time (preAbortCalls) and arms the window; while armed, a newly
     // observed live child is cancelled ONLY when its owner is a pre-abort
-    // call — stragglers of the interrupted run. Children of calls opened
-    // after the abort (the new turn's own spawns, including adopted ones)
-    // are never touched: the window cannot distinguish them by observation,
-    // so it discriminates by owner provenance instead. Disarmed by the next
-    // plain prompt. The proxy wires onOmpLine to omp's stdin.
+    // call — a straggler of the interrupted run with proven ownership.
+    // Children of calls opened or adopted after the abort (the new turn's
+    // own spawns, unseen-parent children) are never touched — adoption is
+    // not proof of age. Disarmed by the next plain prompt. The proxy wires
+    // onOmpLine to omp's stdin.
     this.abortArmed = false;
     this.preAbortCalls = null;
     this.onOmpLine = null;
@@ -638,18 +640,17 @@ class SubagentBridge {
     rec.live = rec.finished === true ? false : observation.live;
     // Post-abort cancellation window, provenance-scoped: a child surfacing
     // after the sweep is cancelled on observation ONLY when its owner is a
-    // pre-abort call (a straggler of the interrupted run) or a call adopted
-    // while the window was armed (an unseen-parent straggler — adoption
-    // during the window is itself proof the child predates the abort).
-    // Children of calls opened after the abort — the new turn's own spawns —
-    // never match. Known residual: a straggler that arrives ownerless AND
-    // is never attributed is left to reconciliation, not window-cancelled.
+    // pre-abort call (a straggler of the interrupted run whose owner is
+    // proven by the abort-time snapshot). Children of calls opened or
+    // ADOPTED after the abort never match — adoption is not proof of age:
+    // an unseen-parent child may be new-turn work, and killing it is worse
+    // than letting a rare straggler run to completion (it is still tracked,
+    // counted toward hold-open, and reconciled post-settle). Known residual:
+    // a straggler that arrives ownerless AND is never attributed is likewise
+    // left to reconciliation, not window-cancelled.
     if (
       this.abortArmed && rec.live === true && rec.ownerCallId !== null
-      && (
-        (this.preAbortCalls !== null && this.preAbortCalls.has(rec.ownerCallId))
-        || this.adoptedCalls.has(rec.ownerCallId)
-      )
+      && this.preAbortCalls !== null && this.preAbortCalls.has(rec.ownerCallId)
     ) {
       rec.live = false;
       rec.finished = true;
