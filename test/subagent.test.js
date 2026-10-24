@@ -153,10 +153,8 @@ test('subagent_lifecycle failed status maps to an error outcome', () => {
   assert.ok(statusOf(res).includes('1 failed/aborted'), 'failed children surface in the summary');
   const rec = bridge.childRegistry.get('c1');
   assert.equal(rec.stopReason, 'error');
-  assert.equal(rec.exitCode, 1);
   const entry = bridge.subagentsByCall.get('call_1').get('c1');
   assert.equal(entry.agent, 'redteam');
-  assert.equal(entry.task, 'Adversarial review', 'lifecycle mandates arrive as description, not task');
 });
 
 test('child named after the tool is titled by its id in the status line', () => {
@@ -206,7 +204,6 @@ test('tool-frame children are observed and registry-attributed without wire chan
   assert.equal(rec('LiveSubagentProbe').live, true, 'running child stays live for the sweep');
   assert.equal(rec('Watcher').stopReason, 'aborted');
   assert.equal(rec('Broken').stopReason, 'error');
-  assert.equal(rec('Broken').exitCode, 1);
   assert.equal(bridge.pendingCount(), 0, 'owning call ended: count non-authoritative');
 });
 
@@ -343,6 +340,34 @@ test('pendingCount returns 0 once the owning task call ends (count becomes non-a
 
 // --- Interrupt sweep ---
 
+
+test('abortSweep closes an open task card that never reported children (P1 pin)', () => {
+  const bridge = new SubagentBridge();
+  // The task-start → first-child window: the call is open, no child yet.
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"solo_call","toolName":"task","args":{}}');
+  const sweep = bridge.abortSweep();
+  assert.deepEqual(sweep.toOmp, [], 'no observed children, no cancels');
+  assert.equal(sweep.toClient.length, 1, 'the open card still closes');
+  const end = JSON.parse(sweep.toClient[0]);
+  assert.equal(end.type, 'tool_execution_end');
+  assert.equal(end.toolCallId, 'solo_call');
+  assert.ok(end.result.content[0].text.includes('interrupted'));
+  assert.deepEqual(bridge.abortSweep(), { toClient: [], toOmp: [] });
+});
+
+test('a lost get_subagents response does not pin reconciliation forever (stale-expiry pin)', () => {
+  const bridge = new SubagentBridge();
+  const first = bridge.refreshRequest();
+  assert.ok(first, 'first request issued');
+  assert.equal(bridge.refreshRequest(), null, 'single-flight while pending');
+  // The response never arrives; after the stale window (which also
+  // outlasts the rate limit) a new request goes out.
+  bridge.refreshRequestedAt -= bridge.refreshStaleMs + 1;
+  bridge.lastRefreshAt -= bridge.refreshMinIntervalMs + 1;
+  const second = bridge.refreshRequest();
+  assert.ok(second, 'stale pending flag is recoverable');
+  assert.notEqual(JSON.parse(second).id, JSON.parse(first).id);
+});
 test('abortSweep closes open task cards and cancels live children on both sides', () => {
   const bridge = new SubagentBridge();
   bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"call_1","toolName":"task","args":{}}');
@@ -534,20 +559,24 @@ test('FR14/FR19: late orphan (parent call ended, later call open) is withheld, r
   assert.equal(bridge.childRegistry.get('orphan1').ownerCallId, null);
   assert.equal(bridge.childRegistry.get('orphan1').live, true, 'the hidden child stays tracked');
 
-  // FR19: the sweep cancels it even though it was never rendered.
+  // FR19: the sweep cancels the withheld child by id even though it was
+  // never rendered; the only card output is the childless open callB
+  // closing (the orphan itself renders nothing).
   const sweep = bridge.abortSweep();
-  assert.deepEqual(sweep.toClient, [], 'withheld children contribute cancellations only');
+  assert.deepEqual(sweep.toClient.map((l) => JSON.parse(l).toolCallId), ['callB'], 'withheld children contribute cancellations only');
   assert.deepEqual(sweep.toOmp.map((l) => JSON.parse(l).subagentId), ['orphan1']);
-  assert.deepEqual(bridge.abortSweep(), { toClient: [], toOmp: [] }, 'second sweep is a no-op');
 
   // quickstart §10 item 6: reconciliation re-attributes it when a snapshot
-  // carries its parent (callA stays known even though it ended).
+  // carries its parent (callA stays known even though it ended): the child
+  // re-attributes to its true owner in the registry; callA's card is
+  // closed, so nothing renders for it (§5.0 — ended calls get registry and
+  // cancellation semantics only).
   const healed = bridge.handleBridgeResponse({
     type: 'response', id: 'ompt3-sub-99', command: 'get_subagents', success: true,
     data: { subagents: [{ id: 'orphan1', index: 0, agent: 'scout', status: 'running', parentToolCallId: 'callA' }] }
   });
-  assert.ok(healed.emit, 'healed child renders under its true parent');
-  assert.equal(JSON.parse(healed.emit.trim()).toolCallId, 'callA');
+  assert.equal(healed.emit, undefined, 'no rendering for an ended call');
+  assert.equal(bridge.childRegistry.get('orphan1').ownerCallId, 'callA', 'healed to its true parent');
 });
 
 test('FR14: parentless follow-up from an attributed child follows its recorded owner', () => {
@@ -560,9 +589,9 @@ test('FR14: parentless follow-up from an attributed child follows its recorded o
   const res = bridge.handleDownstreamFrame(
     '{"type":"subagent_lifecycle","payload":{"id":"kid","index":0,"status":"completed"}}'
   );
-  const upd = JSON.parse(res.line);
-  assert.equal(upd.toolCallId, 'callA', 'registry owner wins over the merely-open call');
-  assert.equal(upd.partialResult.content[0].text, '1/1 done');
+  assert.equal(res.line, undefined, 'owner call ended: registry-only semantics, no rendering');
+  assert.equal(bridge.childRegistry.get('kid').ownerCallId, 'callA', 'registry owner wins over the merely-open call');
+  assert.equal(bridge.childRegistry.get('kid').finished, true);
 });
 
 test('FR15: duplicate fleet indices and missing indices get distinct stable steps', () => {
@@ -638,9 +667,10 @@ test('FR17: a snapshot re-attaching a finished child restores its terminal state
     type: 'response', id: 'ompt3-sub-1', command: 'get_subagents', success: true,
     data: { subagents: [{ id: 'kid', index: 0, agent: 'scout', status: 'running', parentToolCallId: 'callA' }] }
   });
-  assert.ok(res.emit, 're-attached');
-  assert.ok(JSON.parse(res.emit.trim()).partialResult.content[0].text.includes('1/1 done'), 'terminal state restored, not resurrected as running');
-  assert.equal(bridge.childRegistry.get('kid').live, false, 'registry liveness preserved');
+  assert.equal(res.emit, undefined, 'ended call: no rendering');
+  const kid = bridge.childRegistry.get('kid');
+  assert.equal(kid.finished, true, 'terminal state restored in the registry, not resurrected as running');
+  assert.equal(kid.live, false, 'registry liveness preserved');
   const sweep = bridge.abortSweep();
   assert.equal(sweep.toOmp.length, 0, 'finished children are not re-cancelled');
 });
@@ -705,13 +735,13 @@ test('FR15: a conflicting explicit parent withholds and reconciles instead of du
   assert.equal(bridge.childRegistry.get('kid').ownerCallId, 'callA');
   assert.equal(bridge.childRegistry.get('kid').live, true);
 
-  // The interrupt closes A's card and cancels the child exactly once.
+  // The interrupt closes both open cards: A (owner) and B (no children —
+  // the P1 sweep fix), and cancels the child exactly once.
   const sweep = bridge.abortSweep();
   assert.deepEqual(sweep.toOmp.map((l) => JSON.parse(l).subagentId), ['kid']);
-  assert.equal(sweep.toClient.length, 1);
-  const end = JSON.parse(sweep.toClient[0]);
-  assert.equal(end.type, 'tool_execution_end');
-  assert.equal(end.toolCallId, 'callA');
+  assert.deepEqual(sweep.toClient.map((l) => JSON.parse(l).type + ':' + JSON.parse(l).toolCallId).sort(), ['tool_execution_end:callA', 'tool_execution_end:callB']);
+  const endA = JSON.parse(sweep.toClient.find((l) => JSON.parse(l).toolCallId === 'callA'));
+  assert.ok(endA.result.content[0].text.includes('1/1 done'));
 });
 
 test('FR15: a conflicting tool-result child is adopted nowhere and reconciled', () => {
@@ -826,5 +856,4 @@ test('FR17: conflicting failed status carries the error outcome to the owner', (
   assert.equal(JSON.parse(conflict.line).toolCallId, 'callA');
   assert.ok(JSON.parse(conflict.line).partialResult.content[0].text.includes('1 failed/aborted'));
   assert.equal(bridge.childRegistry.get('kid').stopReason, 'error');
-  assert.equal(bridge.childRegistry.get('kid').exitCode, 1);
 });

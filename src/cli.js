@@ -80,12 +80,13 @@ function parseArgs(argv) {
 }
 
 /**
- * Cache path for the shim-managed subagent-concurrency overlay
- * (same XDG pattern as the model catalog cache).
+ * Cache path for the shim-managed subagent-concurrency overlay, keyed by
+ * the cap value: concurrent shims with the same cap share one immutable
+ * file (no last-writer-wins), different caps get different files.
  */
-function subagentOverlayPath() {
+function subagentOverlayPath(max) {
   const cacheDir = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
-  return path.join(cacheDir, 'omp-t3', 'subagent-limits.yml');
+  return path.join(cacheDir, 'omp-t3', `subagent-limits-${max}.yml`);
 }
 
 /**
@@ -101,24 +102,38 @@ function subagentOverlayPath() {
  * omp's single V8 heap, so bounding live children bounds the peak that
  * OOM-killed long fan-out sessions.
  *
- * Returns [] unless `rawValue` is a positive integer — every default
- * launch (and every invalid value, warned about on stderr) injects
- * nothing. `--config` is repeatable in omp, so this never collides with
+ * Returns [] unless `rawValue` is a plain decimal positive integer
+ * (`/^\d+$/` — no `0x10`, no `1e3`, no padded whitespace) — every default
+ * launch (and every invalid value, warned about on stderr with the value
+ * control-character-sanitized) injects nothing. The overlay is written
+ * atomically (temp + rename, so a concurrent reader never sees a torn
+ * file and a pre-existing symlink at the target is replaced, not
+ * followed); if the cache dir is unwritable the shim warns and launches
+ * WITHOUT the cap rather than dying — availability over enforcement.
+ * `--config` is repeatable in omp, so this never collides with
  * user-passed overlays.
  * @param {string|undefined} rawValue process.env.OMPT3_MAX_SUBAGENTS
  * @returns {string[]} argv items to append ('--config', <path>)
  */
 function subagentCapArgs(rawValue) {
   if (rawValue === undefined || rawValue === null || rawValue === '') return [];
-  const max = Number(rawValue);
-  if (!Number.isInteger(max) || max < 1) {
-    console.error(`[omp-t3] Ignoring OMPT3_MAX_SUBAGENTS='${rawValue}': expected a positive integer.`);
+  if (!/^\d+$/.test(rawValue) || Number(rawValue) < 1) {
+    const shown = String(rawValue).replace(/[\u0000-\u001f\u007f]/g, '?');
+    console.error(`[omp-t3] Ignoring OMPT3_MAX_SUBAGENTS='${shown}': expected a plain positive integer (e.g. 5).`);
     return [];
   }
-  const overlayPath = subagentOverlayPath();
-  fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
-  fs.writeFileSync(overlayPath, `task:\n  maxConcurrency: ${max}\n`);
-  return ['--config', overlayPath];
+  const max = Number(rawValue);
+  try {
+    const overlayPath = subagentOverlayPath(max);
+    fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
+    const tmp = `${overlayPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `task:\n  maxConcurrency: ${max}\n`);
+    fs.renameSync(tmp, overlayPath);
+    return ['--config', overlayPath];
+  } catch (err) {
+    console.error(`[omp-t3] OMPT3_MAX_SUBAGENTS=${max} ignored: cannot write the config overlay (${err.message}); launching without the cap.`);
+    return [];
+  }
 }
 
 /**

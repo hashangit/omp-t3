@@ -70,7 +70,7 @@ function terminalOutcome(status) {
   }
   if (status === 'aborted') return { finished: true, stopReason: 'aborted' };
   if (status === 'failed' || status === 'error') {
-    return { finished: true, stopReason: 'error', exitCode: 1 };
+    return { finished: true, stopReason: 'error' };
   }
   return { finished: false };
 }
@@ -97,6 +97,8 @@ class SubagentBridge {
     // plus single-flight/rate-limit state for get_subagents reconciliation.
     this.seq = 0;
     this.refreshPending = false;
+    this.refreshRequestedAt = 0;
+    this.refreshStaleMs = 10000;
     this.lastRefreshAt = 0;
     this.refreshMinIntervalMs = 1000;
     // Transient flag: handleDownstreamFrame sets it when a NEW task tool
@@ -126,27 +128,27 @@ class SubagentBridge {
   }
 
   /**
-   * Projects a terminal observation onto the recorded owner's rendered
-   * card. Conflict and withhold paths update the registry for a child
-   * whose card lives under another call — without this projection the
+   * Projects a terminal observation onto the recorded owner's status line.
+   * Conflict and withhold paths update the registry for a child whose
+   * owner card lives under another call — without this projection the
    * owner's entry stays `finished:false` into the settle (the original
    * zombie mechanism under a new input sequence). Terminal-sticky: an
    * already terminal entry keeps its own outcome (first terminal wins).
+   * Emits only while the owner's call is still OPEN: a closed card accepts
+   * no further rendering (§5.0 — ended calls get cancellations only).
    * @param {{ ownerCallId?: string|null }} rec registry record
    * @param {string} childId
-   * @param {{ finished?: boolean, stopReason?: string, exitCode?: number }} observation
+   * @param {{ finished?: boolean, stopReason?: string }} observation
    * @returns {string|undefined} synthesized owner update line, or undefined
    */
   projectTerminalToOwner(rec, childId, observation) {
     if (!rec || !rec.ownerCallId || observation.finished !== true) return undefined;
+    if (!this.openCalls.has(rec.ownerCallId)) return undefined;
     const calls = this.subagentsByCall.get(rec.ownerCallId);
     const entry = calls && calls.get(childId);
     if (!entry || entry.finished === true) return undefined;
     entry.finished = true;
     if (observation.stopReason !== undefined) entry.stopReason = observation.stopReason;
-    if (observation.exitCode !== undefined && entry.exitCode === undefined) {
-      entry.exitCode = observation.exitCode;
-    }
     return this.synthesizeStatus(rec.ownerCallId, calls);
   }
 
@@ -245,6 +247,7 @@ class SubagentBridge {
       typeof payload.parentToolCallId === 'string' ? payload.parentToolCallId : null,
       id
     );
+    if (callId) this.adoptUnseenCall(callId);
     if (!callId) {
       // FR14/FR19: ambiguous or unattachable update — withheld from
       // rendering (no card is minted), but the child is real and registered
@@ -260,8 +263,7 @@ class SubagentBridge {
           status: observedStatus,
           live: !t.finished,
           finished: t.finished,
-          stopReason: t.stopReason,
-          exitCode: t.exitCode
+          stopReason: t.stopReason
         };
       }
       this.registerObserved(id, null, undefined, observation);
@@ -291,18 +293,10 @@ class SubagentBridge {
     if (parsed.type === 'subagent_lifecycle') {
       const name = typeof nested.agent === 'string' && nested.agent ? nested.agent : payload.agent;
       if (typeof name === 'string' && name) entry.agent = name !== 'task' ? name : id;
-      // SubagentLifecyclePayload carries the mandate as `description`
-      // (no `task` field); progress frames carry it as `task`.
-      const desc = typeof nested.task === 'string' && nested.task ? nested.task
-        : typeof payload.task === 'string' && payload.task ? payload.task
-          : typeof payload.description === 'string' && payload.description ? payload.description : null;
-      if (desc) entry.task = desc;
       this.applyStatus(entry, payload.status);
     } else if (parsed.type === 'subagent_progress') {
       const name = typeof nested.agent === 'string' && nested.agent ? nested.agent : payload.agent;
       if (typeof name === 'string' && name) entry.agent = name !== 'task' ? name : id;
-      const desc = typeof nested.task === 'string' && nested.task ? nested.task : payload.task;
-      if (typeof desc === 'string' && desc) entry.task = desc;
       if (typeof nested.resolvedModelIdentity === 'string' && nested.resolvedModelIdentity) {
         entry.model = nested.resolvedModelIdentity;
       } else if (typeof nested.resolvedModel === 'string' && nested.resolvedModel) {
@@ -328,10 +322,6 @@ class SubagentBridge {
       if (event.type === 'agent_end') entry.finished = true;
     }
 
-    // Narration for the status line: while the child runs, its own step
-    // narration (`lastIntent`) wins; recentOutput is the output-tail
-    // fallback (feature 002 FR6 precedence, carried into the line).
-
     // FR19: every observed child is registered — attributed children with
     // their owner and frozen step, so parentless follow-up frames resolve
     // via the registry (§5.3 rule 2). The terminal outcome is recorded so
@@ -340,10 +330,13 @@ class SubagentBridge {
       status: observedStatus,
       live: entry.finished !== true,
       finished: entry.finished === true,
-      stopReason: entry.stopReason,
-      exitCode: entry.exitCode
+      stopReason: entry.stopReason
     });
 
+    // Status updates render only while the owning call is OPEN: a closed
+    // card accepts no further rendering (§5.0 — ended calls get
+    // cancellations only, tracked in the registry).
+    if (!this.openCalls.has(callId)) return { handled: true };
     return { handled: true, line: this.synthesizeStatus(callId, calls) };
   }
 
@@ -405,7 +398,6 @@ class SubagentBridge {
     if (!t.finished) return;
     entry.finished = true;
     if (t.stopReason !== undefined) entry.stopReason = t.stopReason;
-    if (t.exitCode !== undefined && entry.exitCode === undefined) entry.exitCode = t.exitCode;
   }
 
   /**
@@ -460,14 +452,16 @@ class SubagentBridge {
 
   /**
    * Interrupt path: terminalizes every tracked unfinished child and returns
-   * both wire outputs. For T3, one synthetic `tool_execution_end` per OPEN
-   * task call closes its card before the settle synthesis (after
+   * both wire outputs. For T3, one synthetic `tool_execution_end` closes
+   * EVERY open task card before the settle synthesis (after
    * `agent_settled` the Pi adapter drops every frame, so an open tool card
-   * would hang "running" forever). For omp, one `cancel_subagent` request
-   * per live child so detached children are hard-killed instead of running
-   * on invisibly — mirroring T3's own adapters, which propagate a parent
-   * interrupt down to the children. Ended calls' cards are already closed:
-   * their re-attached children contribute cancellations only.
+   * would hang "running" forever) — including a call whose first child
+   * never reported (the task-start→first-child window) or that spawned
+   * none at all. For omp, one `cancel_subagent` request per live child so
+   * detached children are hard-killed instead of running on invisibly —
+   * mirroring T3's own adapters, which propagate a parent interrupt down
+   * to the children. Ended calls' cards are already closed: their
+   * re-attached children contribute cancellations only.
    * Called synchronously on the upstream abort line, BEFORE any settle
    * synthesis is written to T3.
    * @returns {{ toClient: string[], toOmp: string[] }}
@@ -481,7 +475,8 @@ class SubagentBridge {
       type: 'cancel_subagent',
       subagentId: childId
     }) + '\n';
-    for (const [callId, calls] of this.subagentsByCall) {
+    // Pass 1: terminalize tracked children under any call, open or ended.
+    for (const [, calls] of this.subagentsByCall) {
       for (const [childId, entry] of calls) {
         // Flip registry liveness so the pass below cannot double-cancel,
         // and keep terminal states sticky.
@@ -497,22 +492,21 @@ class SubagentBridge {
         if (rec) {
           rec.finished = true;
           rec.stopReason = entry.stopReason;
-          if (entry.exitCode !== undefined) rec.exitCode = entry.exitCode;
         }
       }
-      // Close the card of every OPEN call with tracked children. Ended
-      // calls are already closed; their late children die via cancellation.
-      // The open-set removal makes the sweep idempotent: a second sweep
-      // (or one after a post-abort snapshot) emits nothing.
-      if (this.openCalls.has(callId)) {
-        this.openCalls.delete(callId);
-        toClient.push(JSON.stringify({
-          type: 'tool_execution_end',
-          toolCallId: callId,
-          toolName: 'task',
-          result: { content: [{ type: 'text', text: `${this.statusLine(calls)} · interrupted` }] }
-        }) + '\n');
-      }
+    }
+    // Pass 2: close every open card. The open-set removal makes the sweep
+    // idempotent: a second sweep (or one after a post-abort snapshot)
+    // emits nothing.
+    for (const callId of [...this.openCalls]) {
+      this.openCalls.delete(callId);
+      const calls = this.subagentsByCall.get(callId) ?? new Map();
+      toClient.push(JSON.stringify({
+        type: 'tool_execution_end',
+        toolCallId: callId,
+        toolName: 'task',
+        result: { content: [{ type: 'text', text: `${this.statusLine(calls)} · interrupted` }] }
+      }) + '\n');
     }
     // FR19: withheld (unattributed) children have no owning call, hence no
     // card — they still contribute a cancellation by id so the interrupt
@@ -534,16 +528,16 @@ class SubagentBridge {
    * the owner and projected step freeze at first ATTRIBUTED observation
    * (FR15) and are never unset. `live` mirrors the latest observation:
    * true while the child is believed running, false once a terminal status
-   * was observed or the sweep cancelled it. The terminal outcome
-   * (`finished`/`stopReason`/`exitCode`) is preserved so an entry whose
-   * per-call map was pruned can be re-attached in its terminal state
-   * instead of resurrecting as running (FR15/FR17: terminal states stick).
+   * was observed or the sweep cancelled it. The terminal outcome is
+   * preserved so an entry whose per-call map was pruned can be re-attached
+   * in its terminal state instead of resurrecting as running (FR15/FR17:
+   * terminal states stick).
    * @param {string} childId
    * @param {string|null} ownerCallId
    * @param {number|undefined} step projected step (only stored with an owner)
    * @param {{ status?: string, live: boolean, finished?: boolean,
-   *     stopReason?: string, exitCode?: number }} observation
-   * @returns {{ ownerCallId, step, live, status, finished, stopReason, exitCode }}
+   *     stopReason?: string }} observation
+   * @returns {{ ownerCallId, step, live, status, finished, stopReason }}
    */
   registerObserved(childId, ownerCallId, step, observation) {
     let rec = this.childRegistry.get(childId);
@@ -554,8 +548,7 @@ class SubagentBridge {
         live: true,
         status: undefined,
         finished: false,
-        stopReason: undefined,
-        exitCode: undefined
+        stopReason: undefined
       };
       this.childRegistry.set(childId, rec);
     }
@@ -567,7 +560,6 @@ class SubagentBridge {
     if (observation.finished === true) {
       rec.finished = true;
       if (observation.stopReason !== undefined) rec.stopReason = observation.stopReason;
-      if (observation.exitCode !== undefined) rec.exitCode = observation.exitCode;
     }
     // Terminal stickiness regardless of attribution: once a child is
     // finished, no later observation — stale running progress, tool update,
@@ -576,6 +568,21 @@ class SubagentBridge {
     // this rule alone.
     rec.live = rec.finished === true ? false : observation.live;
     return rec;
+  }
+
+  /**
+   * Mid-turn attach (attribution rule 4): a child resolved to an explicit
+   * parent the bridge never saw start — the shim attached mid-turn, so T3
+   * has the open card even though this process missed its start frame.
+   * Adopt the call as known-and-open so status lines render and the
+   * interrupt sweep closes it. Only reachable while no task call was ever
+   * seen; later task starts arrive through handleDownstreamFrame normally.
+   * @param {string} callId
+   */
+  adoptUnseenCall(callId) {
+    if (this.taskCalls.has(callId)) return;
+    this.taskCalls.add(callId);
+    this.openCalls.add(callId);
   }
 
   /**
@@ -597,43 +604,35 @@ class SubagentBridge {
       : undefined;
     const entry = {
       agent: undefined,
-      task: '',
-      step: frozenStep !== undefined ? frozenStep : this.assignStep(calls, callId, ownIndex),
+      step: frozenStep !== undefined ? frozenStep : this.assignStep(calls, ownIndex),
       finished: false
     };
     if (rec && rec.finished === true) {
       entry.finished = true;
       if (rec.stopReason !== undefined) entry.stopReason = rec.stopReason;
-      if (rec.exitCode !== undefined) entry.exitCode = rec.exitCode;
     }
     calls.set(childId, entry);
     return entry;
   }
 
   /**
-   * Assigns the projected step for a child's FIRST attributed attach
-   * (FR15 / contract §5.4): the child's own fleet index when present and
-   * not already used by a sibling under the same parent, otherwise the next
-   * free integer above the parent's current maximum. Sibling steps include
-   * registry-recorded steps of children owned by this call, so re-attaches
-   * after the parent's per-call map was pruned cannot collide either. The
-   * result is frozen by the caller for the child's lifetime.
+   * Assigns the child's display order in the status line (FR15 — display
+   * order only since §5.0): the child's own fleet index when not already
+   * used by a sibling under the same parent, otherwise the next free
+   * integer. Frozen by the caller for the child's lifetime so the line
+   * never reshuffles mid-run.
    * @param {Map<string, object>} calls parent's current rendered children
-   * @param {string} callId
    * @param {number|undefined} ownIndex the child's own fleet index
    * @returns {number}
    */
-  assignStep(calls, callId, ownIndex) {
+  assignStep(calls, ownIndex) {
     const used = new Set();
     let max = -1;
-    const consider = (s) => {
-      if (typeof s !== 'number') return;
-      used.add(s);
-      if (s > max) max = s;
-    };
-    for (const e of calls.values()) consider(e.step);
-    for (const rec of this.childRegistry.values()) {
-      if (rec.ownerCallId === callId) consider(rec.step);
+    for (const e of calls.values()) {
+      if (typeof e.step === 'number') {
+        used.add(e.step);
+        if (e.step > max) max = e.step;
+      }
     }
     if (typeof ownIndex === 'number' && !used.has(ownIndex)) return ownIndex;
     let next = max + 1;
@@ -650,9 +649,16 @@ class SubagentBridge {
    */
   refreshRequest() {
     const now = Date.now();
-    if (this.refreshPending) return null;
+    // A pending request whose response never arrives (omp restart, dropped
+    // frame) would pin refreshPending forever and kill reconciliation for
+    // the whole session: after a stale window, allow a fresh request.
+    if (this.refreshPending) {
+      if (now - this.refreshRequestedAt < this.refreshStaleMs) return null;
+      this.refreshPending = false;
+    }
     if (now - this.lastRefreshAt < this.refreshMinIntervalMs) return null;
     this.refreshPending = true;
+    this.refreshRequestedAt = now;
     this.lastRefreshAt = now;
     return JSON.stringify({ id: `ompt3-sub-${++this.seq}`, type: 'get_subagents' }) + '\n';
   }
@@ -700,6 +706,7 @@ class SubagentBridge {
         typeof snap.parentToolCallId === 'string' ? snap.parentToolCallId : null,
         childId
       );
+      if (callId) this.adoptUnseenCall(callId);
       if (!callId) {
         // FR14/FR19: unattributable snapshot child — withheld from
         // rendering, but registered live (omp lists only live children) so
@@ -709,12 +716,12 @@ class SubagentBridge {
           status: snapStatus,
           live: !t.finished,
           finished: t.finished,
-          stopReason: t.stopReason,
-          exitCode: t.exitCode
+          stopReason: t.stopReason
         };
         const rec = this.registerObserved(childId, null, undefined, observation);
         // A conflicting-parent terminal observation reaches the recorded
-        // owner's card too — never only the registry.
+        // owner's status line too — never only the registry (when that
+        // call is still open; projectTerminalToOwner gates).
         const ownerLine = this.projectTerminalToOwner(rec, childId, observation);
         if (ownerLine) ownerOut += ownerLine;
         continue;
@@ -731,20 +738,22 @@ class SubagentBridge {
       const entry = calls.get(childId)
         ?? this.attachChild(calls, callId, childId, typeof snap.index === 'number' ? snap.index : undefined);
       if (!existed) changedCalls.set(callId, calls);
-      // New entries still take name/mandate/model/narration from the
-      // snapshot; the change flag only gates re-emission for known ones.
+      // New entries still take name/model/narration from the snapshot;
+      // the change flag only gates re-emission for known ones.
       if (this.applySnapshot(entry, snap, childId)) changedCalls.set(callId, calls);
       this.registerObserved(childId, callId, entry.step, {
         status: snapStatus,
         live: entry.finished !== true,
         finished: entry.finished === true,
-        stopReason: entry.stopReason,
-        exitCode: entry.exitCode
+        stopReason: entry.stopReason
       });
     }
-    if (changedCalls.size === 0) return ownerOut || undefined;
+    // Emit only for calls whose card is still open; ended calls keep
+    // registry/cancellation semantics only (§5.0).
     let out = '';
-    for (const [callId, calls] of changedCalls) out += this.synthesizeStatus(callId, calls);
+    for (const [callId, calls] of changedCalls) {
+      if (this.openCalls.has(callId)) out += this.synthesizeStatus(callId, calls);
+    }
     return (out + ownerOut) || undefined;
   }
 
@@ -764,12 +773,8 @@ class SubagentBridge {
       entry.agent = agent;
       changed = true;
     }
-    const desc = [snap.task, snap.description, snap.assignment]
-      .find((t) => typeof t === 'string' && t);
-    if (typeof desc === 'string' && desc && entry.task !== desc) {
-      entry.task = desc;
-      changed = true;
-    }
+    // (Mandate text is not tracked: the status line renders name/model/
+    // narration only.)
     const progress = snap.progress && typeof snap.progress === 'object' ? snap.progress : {};
     const model = typeof progress.resolvedModelIdentity === 'string' && progress.resolvedModelIdentity
       ? progress.resolvedModelIdentity
@@ -824,8 +829,7 @@ class SubagentBridge {
           status: obs.status,
           live: obs.finished !== true,
           finished: obs.finished === true,
-          stopReason: obs.stopReason,
-          exitCode: obs.exitCode
+          stopReason: obs.stopReason
         });
         const ownerLine = this.projectTerminalToOwner(rec, childId, obs);
         if (ownerLine) this.pendingOwnerLines.push(ownerLine);
@@ -871,7 +875,6 @@ class SubagentBridge {
     // entry lacks only — never displacing event-learned narration).
     let changed = !existed;
     if (obs.agent && !mapped.agent) mapped.agent = obs.agent;
-    if (obs.task && !mapped.task) mapped.task = obs.task;
     if (obs.model && !mapped.model) mapped.model = obs.model;
     if (typeof obs.lastIntent === 'string' && obs.lastIntent && mapped._intent !== obs.lastIntent) {
       mapped._intent = obs.lastIntent;
@@ -884,23 +887,24 @@ class SubagentBridge {
     if (obs.finished === true && mapped.finished !== true) {
       mapped.finished = true;
       if (obs.stopReason !== undefined) mapped.stopReason = obs.stopReason;
-      if (obs.exitCode !== undefined) mapped.exitCode = obs.exitCode;
       changed = true;
     }
     this.registerObserved(childId, frozenStep !== undefined ? rec.ownerCallId : callId, mapped.step, {
       status: obs.status,
       live: mapped.finished !== true,
       finished: mapped.finished === true,
-      stopReason: mapped.finished === true ? mapped.stopReason : undefined,
-      exitCode: mapped.finished === true ? mapped.exitCode : undefined
+      stopReason: mapped.finished === true ? mapped.stopReason : undefined
     });
-    if (changed) this.pendingOwnerLines.push(this.synthesizeStatus(callId, calls));
+    // Status updates render only while the call is OPEN (§5.0).
+    if (changed && this.openCalls.has(callId)) {
+      this.pendingOwnerLines.push(this.synthesizeStatus(callId, calls));
+    }
   }
 
   /**
    * Projects a raw OMP progress/results item onto a plain observation
-   * record: { agent, task, model, step, status, finished, stopReason,
-   * exitCode, lastIntent }. Never mutates the item.
+   * record: { agent, model, step, status, finished, stopReason,
+   * lastIntent }. Never mutates the item.
    */
   observeEntry(item) {
     const obs = {};
@@ -920,14 +924,6 @@ class SubagentBridge {
       obs.agent = item.id;
     }
 
-    if (typeof item.task === 'string' && item.task.length > 0) {
-      obs.task = item.task;
-    } else if (typeof item.prompt === 'string' && item.prompt.length > 0) {
-      obs.task = item.prompt;
-    } else if (typeof item.description === 'string' && item.description.length > 0) {
-      obs.task = item.description;
-    }
-
     if (typeof item.step === 'number') {
       obs.step = item.step;
     } else if (typeof item.index === 'number') {
@@ -938,13 +934,9 @@ class SubagentBridge {
     if (t.finished) {
       obs.finished = true;
       if (t.stopReason !== undefined) obs.stopReason = t.stopReason;
-      if (t.exitCode !== undefined && typeof item.exitCode !== 'number') obs.exitCode = t.exitCode;
     }
     if (typeof item.stopReason === 'string' && obs.stopReason === undefined) {
       obs.stopReason = item.stopReason;
-    }
-    if (typeof item.exitCode === 'number' && obs.exitCode === undefined) {
-      obs.exitCode = item.exitCode;
     }
     if (typeof item.model === 'string') {
       obs.model = item.model;

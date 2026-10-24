@@ -191,8 +191,8 @@ function createProxyPipeline(options) {
         return;
       }
 
-      // 3. Check subagent bridge (subagent_* events, task tool rename, and
-      //    responses to bridge-injected ompt3-sub-* RPC)
+      // 3. Check subagent bridge (subagent_* events, task tool-card
+      //    status lines, and responses to bridge-injected ompt3-sub-* RPC)
       if (trimmed.includes('ompt3-sub-')) {
         try {
           const bridgeResp = subagentBridge.handleBridgeResponse(JSON.parse(trimmed));

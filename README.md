@@ -134,13 +134,13 @@ Each omp subagent is an in-process async task sharing omp's single V8 heap. Long
 OMPT3_MAX_SUBAGENTS=5 omp-t3   # exec omp-t3 "$@" for a passthrough wrapper
 ```
 
-What happens: the shim writes `~/.cache/omp-t3/subagent-limits.yml` and adds `--config <that file>` to the omp launch. omp queues the 6th+ concurrent `task` spawn (T3 needs no change — queued children simply open their cards later, and hold-open counts stay truthful) and tells the model "Max 5 concurrent subagents; excess queue." in its system prompt, so disciplined leads dispatch in waves without hitting the queue. The cap is per-omp-session, not machine-wide: your direct `omp` terminals keep their own setting.
+What happens: the shim atomically writes `~/.cache/omp-t3/subagent-limits-<N>.yml` (one immutable file per distinct cap, so concurrent shims never overwrite each other) and adds `--config <that file>` to the omp launch. omp queues the 6th+ concurrent `task` spawn (T3 needs no change — queued children simply appear later, and hold-open counts stay truthful) and tells the model "Max 5 concurrent subagents; excess queue." in its system prompt, so disciplined leads dispatch in waves without hitting the queue. The value must be a plain positive integer (`5`, not `0x10`/`1e3`/padded); anything else is warned about on stderr and ignored, and an unwritable cache dir degrades to launching without the cap (never a crash). The cap is per-omp-session, not machine-wide: your direct `omp` terminals keep their own setting.
 
 Long-running delegated work does not belong in native subagents at all: per [AGENTS.md §Subagents](AGENTS.md), use T3's `delegate_task` MCP tool — those children run as T3-owned threads (openable in T3's UI, outside omp's heap) instead of in-process cards.
 
 ## CLI
 
-`omp-t3` handles four flags locally; everything else is forwarded to `omp` untouched (only `--mode rpc` is rewritten to `--mode rpc-ui`, and `OMPT3_MAX_SUBAGENTS` opt-in adds one `--config` overlay — see [Limiting concurrent subagents](#limiting-concurrent-subagents)):
+`omp-t3` handles four helper flags plus the `update` subcommand locally; everything else is forwarded to `omp` untouched (only `--mode rpc` is rewritten to `--mode rpc-ui`, and `OMPT3_MAX_SUBAGENTS` opt-in adds one `--config` overlay — see [Limiting concurrent subagents](#limiting-concurrent-subagents)):
 
 | Command | Behavior |
 |---|---|
@@ -171,7 +171,7 @@ npm test
 
 ## Changelog
 
-### Unreleased
+### 1.4.0-1
 
 - **Quick tasks render as tool cards, not fake agents.** omp's `task` subagents no longer masquerade as T3 subagent cards: the `task`→`subagent` rename and `details.results[]` synthesis are gone (task frames pass through byte-identical), and each `task` call instead streams a compact live status line inside its own tool card (child names, models, narration, done/live counts). The interrupt sweep now closes every open task card with one synthetic `tool_execution_end` instead of per-child terminal updates — the phantom-row and zombie-row bug classes (whose root was T3's per-child subagent node keys) are structurally impossible for a generic tool card. Attribution, the live-child registry, `cancel_subagent` hard-kills, hold-open counts, and `get_subagents` reconciliation are unchanged. Long-running delegated work now has a home: AGENTS.md §Subagents directs it to T3's `delegate_task` (openable child threads outside omp's heap).
 - **Subagent concurrency cap (`OMPT3_MAX_SUBAGENTS`).** Opt-in `--config` overlay setting omp's `task.maxConcurrency` (native semaphore queues excess spawns; omp also tells the lead agent the limit in its system prompt). Recommended 5 — native subagents are short parallel workers; see [Limiting concurrent subagents](#limiting-concurrent-subagents).

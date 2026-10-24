@@ -563,7 +563,7 @@ test('E2E: parallel fleet + mid-run interrupt renders exactly the real children 
       && f.result?.content?.[0]?.text?.includes('interrupted'))
       .map((f) => f.toolCallId)
   );
-  assert.deepEqual([...closedCalls].sort(), ['c1', 'c2', 'c3', 'c4', 'c5'], 'every open card closed within the live window');
+  assert.deepEqual([...closedCalls].sort(), ['c1', 'c2', 'c3', 'c4', 'c5', 'c6'], 'every open card closed, including the childless c6');
 
   // Every dispatched child is cancelled - attributed AND withheld - before
   // the abort is forwarded to omp.
