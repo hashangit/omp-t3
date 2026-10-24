@@ -101,16 +101,16 @@ function createProxyPipeline(options) {
       }
       // A plain prompt starts a fresh turn: disarm the post-abort
       // cancellation window (children spawned for THIS prompt are
-      // legitimate work). abort_and_prompt instead arms a short
-      // self-expiring window: the sweep (via handleUpstreamFrame above)
-      // armed it indefinitely, and old-run stragglers surfacing within the
-      // window are cancelled — while the new turn's own children spawn
-      // after model latency, past the expiry. Runs after
-      // handleUpstreamFrame so the sweep arms before any expiry override.
-      if (/"type":\s*"prompt"/.test(trimmed)) {
+      // legitimate work). abort_and_prompt needs no disarm here — its
+      // window is provenance-scoped (only pre-abort calls' children are
+      // cancelled), so it can stay armed across the new turn without
+      // touching the new turn's spawns. Runs after handleUpstreamFrame so
+      // the sweep arms before any disarm.
+      if (
+        /"type":\s*"prompt"/.test(trimmed)
+        && !/"type":\s*"abort_and_prompt"/.test(trimmed)
+      ) {
         subagentBridge.disarmAbort();
-      } else if (/"type":\s*"abort_and_prompt"/.test(trimmed)) {
-        subagentBridge.armTimedCancelWindow();
       }
 
       // 2. Intercept get_available_models

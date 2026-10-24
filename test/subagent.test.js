@@ -921,18 +921,64 @@ test('abort window: children surfacing after the sweep are cancelled on observat
   assert.equal(bridge.childRegistry.get('late').live, false);
 });
 
-test('abort window: a new prompt disarms it (next turn spawns freely)', () => {
+test('P1 provenance: the window cancels only children of pre-abort calls', () => {
   const bridge = new SubagentBridge();
   const cancels = [];
   bridge.onOmpLine = (l) => cancels.push(JSON.parse(l));
-  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"c1","toolName":"task","args":{}}');
-  bridge.abortSweep();
-  // The proxy calls disarmAbort() on prompt/abort_and_prompt frames (see
-  // src/proxy.js upstream path) — mirrored here directly.
-  bridge.handleDownstreamFrame('{"type":"prompt","message":"next turn"}');
+  // Old turn: a task call with a running child.
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"old_call","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"old_call","id":"old_kid","index":0,"status":"running","agent":"scout"}}');
+
+  // The proxy's abort hook (what abort/abort_and_prompt triggers) runs the
+  // sweep: it cancels the tracked child and snapshots taskCalls as the
+  // pre-abort provenance set.
+  const sweep = bridge.abortSweep();
+  assert.deepEqual(sweep.toOmp.map((l) => JSON.parse(l).subagentId), ['old_kid']);
+
+  // Combined abort_and_prompt: the new turn starts AFTER the sweep. Its
+  // call id is unknown at snapshot time, so its children are never
+  // window-cancelled.
+  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"new_call","toolName":"task","args":{}}');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"new_call","id":"new_kid","index":0,"status":"running","agent":"worker"}}');
+  assert.deepEqual(cancels.map((c) => c.subagentId), [], 'new-turn child is never window-cancelled');
+  assert.equal(bridge.childRegistry.get('new_kid').live, true);
+
+  // A straggler of the OLD run (owner in the pre-abort snapshot) surfaces:
+  // window-cancel on observation.
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"old_call","id":"old_kid2","index":0,"status":"running","agent":"scout"}}');
+  assert.deepEqual(cancels.map((c) => c.subagentId), ['old_kid2'], 'pre-abort straggler is window-cancelled');
+  assert.equal(bridge.childRegistry.get('old_kid2').stopReason, 'aborted');
+
+  // A plain prompt disarms the window entirely (the proxy's upstream seam
+  // calls disarmAbort on prompt frames — mirrored here directly).
+  bridge.handleDownstreamFrame('{"type":"prompt","message":"again"}');
   bridge.disarmAbort();
-  bridge.handleDownstreamFrame('{"type":"tool_execution_start","toolCallId":"c2","toolName":"task","args":{}}');
-  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"c2","id":"fresh","index":0,"status":"running","agent":"scout"}}');
-  assert.deepEqual(cancels, [], 'disarmed: new-turn children are never cancelled');
-  assert.equal(bridge.pendingCount(), 1, 'new-turn child counts as pending work');
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"old_call","id":"old_kid3","index":0,"status":"running","agent":"scout"}}');
+  assert.deepEqual(cancels.map((c) => c.subagentId), ['old_kid2'], 'disarmed: no further window cancels');
+});
+
+test('P2 repair: adopted-call children count toward pending (hold-open honesty)', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_mid","id":"m1","index":0,"status":"running","agent":"scout"}}');
+  assert.equal(bridge.pendingCount(), 1, 'adopted-call children are real pending work');
+  assert.equal(bridge.adoptedCalls.has('call_mid'), true, 'adoption recorded');
+  assert.equal(bridge.taskCalls.has('call_mid'), true, 'attribution recorded');
+});
+
+test('P2 repair: adopted ids never capture parentless frames via the sole-call rule', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"bash_like_id","id":"kid","index":0,"status":"running","agent":"scout"}}');
+  // A parentless frame after adoption must be withheld, not captured.
+  const res = bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"id":"stray","index":0,"status":"running"}}');
+  assert.equal(res.line, undefined, 'no capture via the sole-task-call rule');
+  assert.equal(bridge.childRegistry.get('stray').ownerCallId, null, 'stray stays unattributed');
+  assert.equal(bridge.childRegistry.get('kid').ownerCallId, 'bash_like_id', 'original attribution intact');
+});
+
+test('P2 repair: adoption machinery is mutation-pinned (membership asserted directly)', () => {
+  const bridge = new SubagentBridge();
+  bridge.handleDownstreamFrame('{"type":"subagent_lifecycle","payload":{"parentToolCallId":"call_mid","id":"m1","index":0,"status":"running"}}');
+  assert.equal(bridge.taskCalls.has('call_mid'), true, 'call adopted into taskCalls');
+  assert.equal(bridge.openCalls.has('call_mid'), false, 'adopted calls never open (no rendering)');
+  assert.equal(bridge.adoptedCalls.has('call_mid'), true, 'adoptedCalls marks the foreign id');
 });
