@@ -58,6 +58,9 @@ function createProxyPipeline(options) {
     for (const line of sweep.toClient) clientOut.write(line);
     for (const line of sweep.toOmp) childIn.write(line);
   };
+  // Post-abort cancellation window: children that surface AFTER the sweep
+  // are cancelled the moment the bridge observes them (direct omp write).
+  subagentBridge.onOmpLine = (line) => childIn.write(line);
   // Reconciliation against omp's authoritative live child list
   // (get_subagents): heals missed events and refreshes card details.
   const requestSubagentRefresh = () => {
@@ -88,6 +91,18 @@ function createProxyPipeline(options) {
       const upstreamResult = settlementTracker.handleUpstreamFrame(trimmed);
       if (upstreamResult && upstreamResult.emit) {
         clientOut.write(upstreamResult.emit);
+      }
+      // A new turn disarms the post-abort cancellation window: children
+      // spawned for THIS prompt are legitimate work, not stragglers of the
+      // interrupted run. Must run after handleUpstreamFrame so the sweep
+      // (on abort/abort_and_prompt) arms before the disarming prompt.
+      if (
+        trimmed.includes('"type":"prompt"') ||
+        trimmed.includes('"type": "prompt"') ||
+        trimmed.includes('"type":"abort_and_prompt"') ||
+        trimmed.includes('"type": "abort_and_prompt"')
+      ) {
+        subagentBridge.disarmAbort();
       }
 
       // 2. Intercept get_available_models
