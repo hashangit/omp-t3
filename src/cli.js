@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
@@ -126,13 +127,13 @@ function subagentCapArgs(rawValue) {
   try {
     const overlayPath = subagentOverlayPath(max);
     fs.mkdirSync(path.dirname(overlayPath), { recursive: true });
-    const tmp = `${overlayPath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, `task:\n  maxConcurrency: ${max}\n`);
+    const tmp = `${overlayPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     try {
+      fs.writeFileSync(tmp, `task:\n  maxConcurrency: ${max}\n`);
       fs.renameSync(tmp, overlayPath);
-    } catch (renameErr) {
+    } catch (writeErr) {
       fs.rmSync(tmp, { force: true });
-      throw renameErr;
+      throw writeErr;
     }
     return ['--config', overlayPath];
   } catch (err) {

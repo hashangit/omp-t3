@@ -98,12 +98,17 @@ class SubagentBridge {
     // misattribution and is never trusted for adoption (they steal
     // children; only unseen ids can be adopted as missed task starts).
     this.nonTaskCalls = new Set();
-    // Post-abort cancellation window (see disarmAbort): while armed, any
-    // newly observed live child is cancelled the moment it is registered —
-    // omp children that surface after the sweep ran (in-flight spawn
-    // finishing, late snapshot) would otherwise run to completion with
-    // nobody holding their id. The proxy wires onOmpLine to omp's stdin.
+    // Post-abort cancellation window. Plain abort/stop: armed until the
+    // next turn's prompt disarms it (abortArmed). abort_and_prompt: armed
+    // for a short self-expiring window only (cancelWindowUntil) — the arm
+    // and the new turn's prompt land in the same handler, so a plain
+    // boolean would either no-op or cancel the new turn's first spawns;
+    // the expiry covers in-flight spawn stragglers and expires before
+    // model-latency lets the new turn spawn children. The proxy wires
+    // onOmpLine to omp's stdin.
     this.abortArmed = false;
+    this.cancelWindowUntil = null;
+    this.cancelWindowMs = 15000;
     this.onOmpLine = null;
     // Bridge-injected RPC state (ompt3-sub- id namespace): sequence counter
     // plus single-flight/rate-limit state for get_subagents reconciliation.
@@ -200,6 +205,9 @@ class SubagentBridge {
       } else {
         // Started non-task tool (wait/bash/...): an explicit parent pointing
         // here is a distrusted late-event misattribution (see resolveCallId).
+        // Bound the set: session-length growth from a chatty omp is unbounded
+        // otherwise, and only recent ids matter for the distrust check.
+        if (this.nonTaskCalls.size > 4000) this.nonTaskCalls.clear();
         this.nonTaskCalls.add(parsed.toolCallId);
       }
     }
@@ -359,27 +367,25 @@ class SubagentBridge {
   }
 
   /**
-   * Resolves which `task` tool call owns a child frame/snapshot — the
-   * feature 002 FR14 / contract §5.3 ordered rule, identical for event
-   * frames and snapshots:
-   *   1. explicit parent that is a KNOWN task call (open or ended — a late
-   *      completion arriving during a later `wait`/`bash` lands on its true
-   *      parent; wait/bash are not task calls, so they never match) — UNLESS
-   *      it conflicts with the recorded owner (see rule 2);
-   *   2. a child the bridge has already attributed -> its recorded owner
-   *      (registry-first: later parentless frames follow the child, not the
-   *      call timeline; a known explicit parent that CONTRADICTS the owner
-   *      resolves to null so the caller withholds and reconciles — one
-   *      child keeps one parent for life);
-   *   3. the ONLY task call ever seen in the session (single-call runs,
-   *      open or ended — the pinned parentless-frame behavior);
-   *   4. when NO task call was ever seen, the explicit parent (mid-turn
-   *      attach).
-   *   5. otherwise ambiguous: more than one task call exists in the
-   *      session's history and the child is unknown with no usable explicit
-   *      parent. AN OPEN TASK CALL ALONE IS NEVER PROOF OF OWNERSHIP — the
-   *      last-started-call fallback that minted the incident's phantom
-   *      cards is gone; the caller withholds and reconciles instead.
+   * Resolves which `task` tool call owns a child frame/snapshot (contract
+   * §5.3, post-P2-1 trust rule — identical for event frames and snapshots):
+   *   1. a child the bridge has already attributed -> its recorded owner
+   *      (registry-first; ownership is never renegotiated — a known
+   *      explicit parent that contradicts it resolves to null so the
+   *      caller withholds and reconciles);
+   *   2. else an explicit parent that is NOT a seen non-task tool is
+   *      TRUSTED and returned — a known task call, or a task call the
+   *      bridge never saw start (shim attached mid-turn, missed start
+   *      frame), which the caller adopts registry-only via
+   *      adoptUnseenCall;
+   *   3. else (distrusted explicit — a seen wait/bash call — or no
+   *      explicit at all) the ONLY task call ever seen, when exactly one
+   *      exists (the pinned parentless-frame behavior);
+   *   4. otherwise null: ambiguous or unattachable — the caller withholds
+   *      from rendering, registers the child for the interrupt sweep, and
+   *      requests reconciliation. An open task call alone is never proof
+   *      of ownership — the last-started-call fallback that minted the
+   *      incident's phantom cards is gone.
    * @param {string|null} explicit
    * @param {string|null} childId
    * @returns {string|null}
@@ -426,11 +432,35 @@ class SubagentBridge {
 
   /**
    * Disarms the post-abort cancellation window. Called by the proxy when a
-   * new turn starts (prompt / abort_and_prompt): children spawned for the
-   * new turn are legitimate work, not stragglers of the interrupted run.
+   * new turn starts with a plain prompt (children spawned for the new turn
+   * are legitimate work, not stragglers of the interrupted run). The
+   * abort_and_prompt flavor instead arms a short self-expiring window via
+   * armTimedCancelWindow — its own prompt is part of the same frame.
    */
   disarmAbort() {
     this.abortArmed = false;
+    this.cancelWindowUntil = null;
+  }
+
+  /**
+   * Arms a self-expiring cancellation window for abort_and_prompt turns:
+   * old-run stragglers that surface within the window are cancelled on
+   * observation; the window expires before the new turn can spawn children
+   * of its own.
+   * @param {number} [ms] window length (default 15000)
+   */
+  armTimedCancelWindow(ms = this.cancelWindowMs) {
+    this.abortArmed = false;
+    this.cancelWindowUntil = Date.now() + ms;
+  }
+
+  /**
+   * True when the post-abort cancellation window is active.
+   * @returns {boolean}
+   */
+  cancelWindowActive() {
+    if (this.abortArmed) return true;
+    return this.cancelWindowUntil !== null && Date.now() <= this.cancelWindowUntil;
   }
 
   /**
@@ -617,7 +647,7 @@ class SubagentBridge {
     // Post-abort cancellation window: a child surfacing after the sweep ran
     // (in-flight spawn finishing, late snapshot/tool frame before the
     // settle) is cancelled on observation — nobody else holds its id.
-    if (this.abortArmed && rec.live === true) {
+    if (this.cancelWindowActive() && rec.live === true) {
       rec.live = false;
       rec.finished = true;
       if (rec.stopReason === undefined) rec.stopReason = 'aborted';
@@ -630,17 +660,20 @@ class SubagentBridge {
 
   /**
    * Mid-turn attach (attribution rule 4): a child resolved to an explicit
-   * parent the bridge never saw start — the shim attached mid-turn, so T3
-   * has the open card even though this process missed its start frame.
-   * Adopt the call as known-and-open so status lines render and the
-   * interrupt sweep closes it. Only reachable while no task call was ever
-   * seen; later task starts arrive through handleDownstreamFrame normally.
+   * parent the bridge never saw start. Adoption is REGISTRY-ONLY: the
+   * adopted call exists for attribution, registry cancellation, and
+   * pendingCount bookkeeping — never for rendering. The bridge cannot know
+   * whether T3 holds a card for an id it never saw (it may be a missed task
+   * start, or a foreign non-task card whose own start was missed), and
+   * synthesizing status/end frames onto such an id produced phantom cards
+   * and closed real foreign cards (gate round 2 findings P2-1/P2-2). An
+   * adopted call therefore never enters openCalls: status emissions are
+   * gated on openCalls, and the interrupt sweep only closes open calls.
    * @param {string} callId
    */
   adoptUnseenCall(callId) {
     if (this.taskCalls.has(callId)) return;
     this.taskCalls.add(callId);
-    this.openCalls.add(callId);
   }
 
   /**
