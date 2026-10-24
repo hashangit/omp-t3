@@ -4,6 +4,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { parseArgs } = require('../src/cli.js');
 
+// This file pins the STOCK launch rewrite (byte-parity). Delegation
+// enforcement is default-on; it is covered by delegate-enforcement.test.js.
+process.env.OMPT3_DELEGATE_TASKS = '0';
+
 test('parseArgs rewrites --mode rpc to --mode rpc-ui', () => {
   const result = parseArgs(['--mode', 'rpc', '--session', 'abc-123']);
   assert.equal(result.action, 'proxy');
