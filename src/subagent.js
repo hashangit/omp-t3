@@ -98,17 +98,21 @@ class SubagentBridge {
     // misattribution and is never trusted for adoption (they steal
     // children; only unseen ids can be adopted as missed task starts).
     this.nonTaskCalls = new Set();
-    // Post-abort cancellation window. Plain abort/stop: armed until the
-    // next turn's prompt disarms it (abortArmed). abort_and_prompt: armed
-    // for a short self-expiring window only (cancelWindowUntil) — the arm
-    // and the new turn's prompt land in the same handler, so a plain
-    // boolean would either no-op or cancel the new turn's first spawns;
-    // the expiry covers in-flight spawn stragglers and expires before
-    // model-latency lets the new turn spawn children. The proxy wires
-    // onOmpLine to omp's stdin.
+    // Task call ids adopted without a seen start (mid-turn attach, missed
+    // start frames): attribution + pendingCount + cancellation only, never
+    // rendering, never counted by rule 3's sole-task-call fallback.
+    this.adoptedCalls = new Set();
+    // Post-abort cancellation window (provenance-scoped). Plain abort or
+    // abort_and_prompt: the sweep snapshots every task-call id known at
+    // abort time (preAbortCalls) and arms the window; while armed, a newly
+    // observed live child is cancelled ONLY when its owner is a pre-abort
+    // call — stragglers of the interrupted run. Children of calls opened
+    // after the abort (the new turn's own spawns, including adopted ones)
+    // are never touched: the window cannot distinguish them by observation,
+    // so it discriminates by owner provenance instead. Disarmed by the next
+    // plain prompt. The proxy wires onOmpLine to omp's stdin.
     this.abortArmed = false;
-    this.cancelWindowUntil = null;
-    this.cancelWindowMs = 15000;
+    this.preAbortCalls = null;
     this.onOmpLine = null;
     // Bridge-injected RPC state (ompt3-sub- id namespace): sequence counter
     // plus single-flight/rate-limit state for get_subagents reconciliation.
@@ -205,9 +209,14 @@ class SubagentBridge {
       } else {
         // Started non-task tool (wait/bash/...): an explicit parent pointing
         // here is a distrusted late-event misattribution (see resolveCallId).
-        // Bound the set: session-length growth from a chatty omp is unbounded
-        // otherwise, and only recent ids matter for the distrust check.
-        if (this.nonTaskCalls.size > 4000) this.nonTaskCalls.clear();
+        // Bound the set without a full wipe: keep the most recent 2000 ids
+        // (Sets preserve insertion order), recent ones are the plausible
+        // parents anyway.
+        if (this.nonTaskCalls.size > 4000) {
+          const keep = [...this.nonTaskCalls].slice(-2000);
+          this.nonTaskCalls.clear();
+          for (const id of keep) this.nonTaskCalls.add(id);
+        }
         this.nonTaskCalls.add(parsed.toolCallId);
       }
     }
@@ -409,9 +418,17 @@ class SubagentBridge {
     // second unseen call's children into the first adopted call and leave
     // its card unclosed at interrupt).
     if (explicit && !this.nonTaskCalls.has(explicit)) return explicit;
-    if (this.taskCalls.size === 1) {
-      for (const only of this.taskCalls) return only;
+    // Rule 3 considers only REAL seen task calls, and only when no adopted
+    // (possibly foreign) id exists: an adopted call must never capture
+    // parentless frames. Mixed/absent provenance → withheld + reconcile.
+    if (this.adoptedCalls.size > 0) return null;
+    let sole = null;
+    let soleCount = 0;
+    for (const call of this.taskCalls) {
+      sole = call;
+      soleCount += 1;
     }
+    if (soleCount === 1) return sole;
     return null;
   }
 
@@ -432,35 +449,14 @@ class SubagentBridge {
 
   /**
    * Disarms the post-abort cancellation window. Called by the proxy when a
-   * new turn starts with a plain prompt (children spawned for the new turn
-   * are legitimate work, not stragglers of the interrupted run). The
-   * abort_and_prompt flavor instead arms a short self-expiring window via
-   * armTimedCancelWindow — its own prompt is part of the same frame.
+   * plain prompt starts a new turn: from that point children are new-turn
+   * work and the window must never cancel them. (abort_and_prompt does NOT
+   * disarm — its window is provenance-scoped, see the constructor note and
+   * abortSweep.)
    */
   disarmAbort() {
     this.abortArmed = false;
-    this.cancelWindowUntil = null;
-  }
-
-  /**
-   * Arms a self-expiring cancellation window for abort_and_prompt turns:
-   * old-run stragglers that surface within the window are cancelled on
-   * observation; the window expires before the new turn can spawn children
-   * of its own.
-   * @param {number} [ms] window length (default 15000)
-   */
-  armTimedCancelWindow(ms = this.cancelWindowMs) {
-    this.abortArmed = false;
-    this.cancelWindowUntil = Date.now() + ms;
-  }
-
-  /**
-   * True when the post-abort cancellation window is active.
-   * @returns {boolean}
-   */
-  cancelWindowActive() {
-    if (this.abortArmed) return true;
-    return this.cancelWindowUntil !== null && Date.now() <= this.cancelWindowUntil;
+    this.preAbortCalls = null;
   }
 
   /**
@@ -546,11 +542,12 @@ class SubagentBridge {
     const toClient = [];
     const toOmp = [];
     const cancelled = new Set();
-    // Arm the post-abort cancellation window: children that surface after
-    // this sweep (in-flight spawn finishing, late snapshot before the
-    // settle) are cancelled on observation via onOmpLine until the next
-    // turn's prompt disarms it.
+    // Arm the post-abort cancellation window: snapshot every task-call id
+    // known at abort time. Stragglers owned by those calls are cancelled on
+    // observation; children of calls opened after the abort (the new
+    // turn's own spawns) never match the snapshot and are never touched.
     this.abortArmed = true;
+    this.preAbortCalls = new Set(this.taskCalls);
     const cancelLine = (childId) => this.cancelLineFor(childId);
     // Pass 1: terminalize tracked children under any call, open or ended.
     for (const [, calls] of this.subagentsByCall) {
@@ -644,10 +641,16 @@ class SubagentBridge {
     // their entry's sticky state; withheld ones (ownerCallId null) rely on
     // this rule alone.
     rec.live = rec.finished === true ? false : observation.live;
-    // Post-abort cancellation window: a child surfacing after the sweep ran
-    // (in-flight spawn finishing, late snapshot/tool frame before the
-    // settle) is cancelled on observation — nobody else holds its id.
-    if (this.cancelWindowActive() && rec.live === true) {
+    // Post-abort cancellation window, provenance-scoped: a child surfacing
+    // after the sweep is cancelled on observation ONLY when its owner is a
+    // pre-abort call (a straggler of the interrupted run). Children of
+    // calls opened after the abort — the new turn's own spawns, adopted or
+    // not — never match the snapshot and are never touched. Unattributed
+    // children have no provable owner and are left to reconciliation.
+    if (
+      this.abortArmed && rec.live === true && rec.ownerCallId !== null
+      && this.preAbortCalls !== null && this.preAbortCalls.has(rec.ownerCallId)
+    ) {
       rec.live = false;
       rec.finished = true;
       if (rec.stopReason === undefined) rec.stopReason = 'aborted';
@@ -673,7 +676,12 @@ class SubagentBridge {
    */
   adoptUnseenCall(callId) {
     if (this.taskCalls.has(callId)) return;
+    // taskCalls membership is attribution-only (rule 2 trust); adoptedCalls
+    // additionally marks the call as an adopted (possibly foreign) id so
+    // pendingCount counts its children and rule 3 never treats it as the
+    // sole real task call. It never enters openCalls — no rendering.
     this.taskCalls.add(callId);
+    this.adoptedCalls.add(callId);
   }
 
   /**
@@ -1052,7 +1060,10 @@ class SubagentBridge {
   pendingCount() {
     let count = 0;
     for (const rec of this.childRegistry.values()) {
-      if (rec.live === true && rec.ownerCallId !== null && this.openCalls.has(rec.ownerCallId)) {
+      if (
+        rec.live === true && rec.ownerCallId !== null
+        && (this.openCalls.has(rec.ownerCallId) || this.adoptedCalls.has(rec.ownerCallId))
+      ) {
         count += 1;
       }
     }
