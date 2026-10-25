@@ -94,6 +94,7 @@ test('extension adaptation still targets the compat copy whose ledger is checked
   const source = [
     'export const handler = (pi) => {',
     '  const commands = pi.getCommands().filter((command) => command.source === "skill");',
+    '  const client = createMcpClient(endpoint, token);',
     '  // ...',
     '};'
   ].join('\n');

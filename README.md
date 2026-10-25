@@ -127,6 +127,8 @@ The check verifies that:
 
 ### Limiting concurrent subagents
 
+The model policy described below blocks native `task` by default. This cap is useful only when both model lists are explicitly cleared to allow native tasks.
+
 Each omp subagent is an in-process async task sharing omp's single V8 heap. Long fan-out fleets (6+ concurrent reviewers with large transcripts) can exhaust that heap and `SIGABRT` the whole provider scope — capping live children bounds the peak. Native `task` subagents are meant for short parallel work, so the recommended cap is 5:
 
 ```bash
@@ -142,11 +144,34 @@ Long-running delegated work does not belong in native subagents at all: per [AGE
 
 By default, `omp-t3` supplies a built-in tool list that excludes OMP's in-process `task` spawner. It appends a system-prompt policy directing delegated work to T3's `delegate_task` MCP tool, where children run in separate, openable threads. The shim removes the native spawner; T3 owns scheduling of delegated threads. `OMPT3_MAX_SUBAGENTS` limits OMP's native tasks only and does not cap T3 `delegate_task` children.
 
-Set `OMPT3_DELEGATE_TASKS=0` to restore stock tooling and preserve user prompt appendices unchanged. An explicit `--tools` list, in either CLI form, also takes precedence and bypasses the shim's tool validation and policy injection. Explicit lists are passed to OMP unchanged, including any validation errors.
+Set `OMPT3_DELEGATE_TASKS=0` to restore the stock tool list and skip the delegation-routing appendix. An explicit `--tools` list, in either CLI form, also takes precedence over tool-list injection and validation. Explicit lists are passed to OMP unchanged, including any validation errors. The separate subagent model policy still applies in both cases and is appended to any user prompt appendix.
 
-For shim-supplied lists, a startup probe waits up to five seconds for OMP's `ready` frame. OMP's singular or plural unknown-tool errors and unavailable-tool errors prune only the named entries, with at most five probes. A timeout, spawn failure, unrecognized error, or empty remaining list falls back to stock tooling with a stderr warning. Fallback preserves the original user arguments, prompt appendix, and concurrency overlay. This fallback restores the native `task` tool, so delegation enforcement is unavailable for that launch.
+For shim-supplied lists, a startup probe waits up to five seconds for OMP's `ready` frame. OMP's singular or plural unknown-tool errors and unavailable-tool errors prune only the named entries, with at most five probes. A timeout, spawn failure, unrecognized error, or empty remaining list falls back to stock tooling with a stderr warning. Fallback preserves user arguments, the concurrency overlay, and the subagent model policy and its blocking hook. The model policy continues to block native `task` on this path.
 
 The probe starts OMP with the launch arguments and agent directory, so configured extensions and MCP servers may initialize during validation as well as during the final launch. Each probe uses its own process group on Unix, which is terminated before the next launch. A `ready` frame validates startup; it does not guarantee model credentials, quotas, or subsequent requests will succeed.
+
+### Restricting subagent models
+
+`omp-t3` defaults to your AGENTS.md model choices. Only `glm-5.3-flash`, `gemini-3.8-flash`, and `deepseek-v4.1-flash` are allowed. The deny rules are `gpt-*sol*`, `*opus*`, `glm-5.3`, and `glm-5.3:*`, covering GPT Sol, Opus, and base GLM 5.3, including its batch variant. The parent model is unaffected.
+
+Set either variable in the environment inherited by `omp-t3` to replace that list:
+
+```bash
+export OMPT3_SUBAGENT_ALLOWED_MODELS='glm-5.3-flash,gemini-3.8-flash,deepseek-v4.1-flash'
+export OMPT3_SUBAGENT_DISALLOWED_MODELS='gpt-*sol*,*opus*,glm-5.3,glm-5.3:*'
+```
+
+Values are comma-separated model IDs or patterns, with `*` as the only wildcard. Matching is case-insensitive and anchored to the whole ID. A rule containing `/` matches the full catalog ID; a rule without `/` matches the final model name. For example, `glm-5.3-flash` matches `openrouter/z-ai/glm-5.3-flash`, while `openrouter/z-ai/glm-5.3-flash` restricts the provider too. Display names such as `GLM 5.3 Flash` are invalid. Whitespace around list entries is ignored. Deny rules always win, even when a model also matches an allow rule.
+
+Exact default rules deliberately exclude aliases such as `glm-flash-latest` and variants such as `glm-5.3-flashx`, dated releases, and `:batch`. Add their exact IDs, or a deliberate wildcard, if you want them. Call `orchestrator_capabilities` to find IDs available in your T3 catalog.
+
+The shim appends these rules to the system prompt on every launch path. A blocking OMP extension checks direct T3 delegation calls, and the adapted T3 MCP client checks again before sending `delegate_task`, including calls through registered tool handlers in scripts. Both T3 tool-name prefixes are covered. Every delegation must set `target.model` explicitly. Omitted, denied, or unlisted models return a tool error before a child starts. Allowed calls retain their provider, model options, and other arguments without rewriting the model.
+
+Native `task` resolves its final model internally, so the hook blocks it while either list is active and directs the agent to T3 delegation. This also applies with `OMPT3_DELEGATE_TASKS=0`, explicit `--tools=task`, or readiness fallback. Unreadable or incompatible bundled T3 extensions, or failure to write the guard files, refuse the launch instead of silently dropping enforcement. A change only to the skill-inlining marker still allows the model guard to load, with a warning about skill inlining.
+
+An explicitly empty value clears that list. An empty allowlist permits any explicit model except those denied; an empty denylist keeps the allowlist. Set **both** variables to empty strings to turn off model restrictions. Combine that with `OMPT3_DELEGATE_TASKS=0` to restore stock native tasks and prompt behavior. Restart the provider session after changing its environment.
+
+This policy covers tools in OMP sessions launched through this shim. It is not a T3 server-wide restriction on other providers, top-level conversations, or arbitrary shell commands.
 
 ## CLI
 

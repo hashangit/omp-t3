@@ -7,6 +7,8 @@ const { parseArgs } = require('../src/cli.js');
 // This file pins the STOCK launch rewrite (byte-parity). Delegation
 // enforcement is default-on; it is covered by delegate-enforcement.test.js.
 process.env.OMPT3_DELEGATE_TASKS = '0';
+process.env.OMPT3_SUBAGENT_ALLOWED_MODELS = '';
+process.env.OMPT3_SUBAGENT_DISALLOWED_MODELS = '';
 
 test('parseArgs rewrites --mode rpc to --mode rpc-ui', () => {
   const result = parseArgs(['--mode', 'rpc', '--session', 'abc-123']);

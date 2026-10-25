@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
 const pkg = require('../package.json');
+const { createSubagentPolicy, subagentPolicyArgs } = require('./subagent_policy.js');
 
 /**
  * Built-in tools enabled for T3-mediated sessions when delegation
@@ -34,6 +35,22 @@ const DELEGATION_POLICY = [
   'Do your own quick, direct work (reads, searches, edits, short commands) with your regular tools instead of delegating.',
   'Do not attempt to use an in-process `task`-style subagent tool: it is intentionally unavailable here.'
 ].join('\n');
+
+function appendSystemPrompt(args, text) {
+  if (!text) return;
+  let found = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--append-system-prompt') {
+      args[i + 1] = `${args[i + 1] ?? ''}\n\n${text}`;
+      i++;
+      found = true;
+    } else if (args[i].startsWith('--append-system-prompt=')) {
+      args[i] += `\n\n${text}`;
+      found = true;
+    }
+  }
+  if (!found) args.push('--append-system-prompt', text);
+}
 
 /**
  * Parses incoming CLI arguments and translates them for OMP execution.
@@ -75,7 +92,6 @@ function parseArgs(argv) {
   const rewritten = [];
   let modeFound = false;
   let toolsFound = false;
-  let appendPromptFound = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -97,7 +113,6 @@ function parseArgs(argv) {
       if (arg === '--tools' && i + 1 < argv.length) rewritten.push(argv[++i]);
     } else if (arg === '--append-system-prompt' || arg.startsWith('--append-system-prompt=')) {
       // Preserve the original appendix for opt-out and validation fallback.
-      appendPromptFound = true;
       if (arg === '--append-system-prompt') {
         rewritten.push(arg);
         if (i + 1 < argv.length) rewritten.push(argv[++i]);
@@ -120,22 +135,16 @@ function parseArgs(argv) {
   // appended to the system prompt, so delegated/subagent work goes through
   // T3's delegate_task MCP tool (isolated, openable child threads). See
   // README "Delegation enforcement".
+  // Model restrictions are independent of delegation routing, explicit tool
+  // lists, and readiness fallback. Keep them on every launch path.
+  const modelPolicy = createSubagentPolicy();
+  appendSystemPrompt(rewritten, modelPolicy.prompt);
+  rewritten.push(...subagentPolicyArgs(modelPolicy));
   const fallbackArgs = rewritten.slice();
   const injectedTools = process.env.OMPT3_DELEGATE_TASKS !== '0' && !toolsFound;
   if (injectedTools) {
     rewritten.push('--tools', DEFAULT_TOOLS.join(','));
-    if (!appendPromptFound) {
-      rewritten.push('--append-system-prompt', DELEGATION_POLICY);
-    } else {
-      for (let i = 0; i < rewritten.length; i++) {
-        if (rewritten[i] === '--append-system-prompt') {
-          rewritten[i + 1] = `${rewritten[i + 1] ?? ''}\n\n${DELEGATION_POLICY}`;
-          i++;
-        } else if (rewritten[i].startsWith('--append-system-prompt=')) {
-          rewritten[i] += `\n\n${DELEGATION_POLICY}`;
-        }
-      }
-    }
+    appendSystemPrompt(rewritten, DELEGATION_POLICY);
   }
 
   // Opt-in subagent concurrency cap (OMPT3_MAX_SUBAGENTS). Without the env
