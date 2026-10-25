@@ -208,6 +208,12 @@ npm test
 
 **Availability note:** the entries below describe the repository's current `main`. As of this writing, npm's dist-tags still serve `latest: 1.3.0-4` / `beta: 1.4.0` — the 1.4.0-x iterations are pending publish. Until they are published, install from a checkout of this repository (`npm install -g .`) or run `bin/omp-t3` directly.
 
+### 1.4.0-5
+
+- **Subagent model restrictions.** Enforces configurable allowlists (`OMPT3_SUBAGENT_ALLOWED_MODELS`) and denylists (`OMPT3_SUBAGENT_DISALLOWED_MODELS`) for subagents launched in OMP sessions, defaulting to AGENTS.md policy: allowed models are `glm-5.3-flash`, `gemini-3.8-flash`, and `deepseek-v4.1-flash`; denied models are `gpt-*sol*`, `*opus*`, `glm-5.3`, and `glm-5.3:*`.
+- **Dual-layer policy enforcement.** The policy is appended to the system prompt on all launch paths, an OMP hook intercepts tool execution to block native `task` and direct `delegate_task` calls, and the adapted T3 MCP client wrapper intercepts `delegate_task` before calls leave the process. In-process native `task` is blocked while policy is active; explicit allowed `target.model` is mandatory.
+- **Fail-closed adaptation & diagnostic updates.** Unresolvable extension drift or cache failure fails closed with exit code 1 instead of dropping enforcement. `omp-t3 --check` diagnostic inspects policy compilation and prints active rules; `omp-t3 --help` documents environment variables.
+
 ### 1.4.0-4
 
 - **Launches validate OMP readiness and preserve user arguments.** Default launches disable native `task` and route delegation to T3, and now prove omp actually started: the shim probes the RPC until it answers `{"type":"ready"}` (bounded at 5000 ms per probe, at most 5 convergence rounds). Probes run in their own Unix process group and are terminated on `SIGINT`/`SIGTERM`/`SIGHUP` or timeout. User-supplied `--append-system-prompt` and `--tools` (space and `=` forms) are preserved and merged with the enforcement injection; `OMPT3_DELEGATE_TASKS=0` opts out entirely; the enforcement fallback relaunches with the caller's original argument list. See [Delegation enforcement](#delegation-enforcement).
@@ -258,24 +264,3 @@ npm test
 - **Local command output renders in T3.** OMP runs builtin slash commands locally and emits `command_output` frames T3 knows nothing about; the shim re-emits each as rendered text inside the command-only turn, ANSI-stripped and wrapped in a fenced code block so T3's markdown renderer keeps omp's aligned bar-chart layout instead of collapsing newlines into a run-on paragraph.
 - **Local-only commands settle.** OMP completes local commands with `data.agentInvoked:false` on the RPC response — no `prompt_result`, no `session_settled` — and T3's own idle probe is suppressed once a turn renders output. The shim synthesizes the terminal `agent_settled` from that signal, so `/context` no longer leaves the turn active forever.
 - `get_commands` answers now echo the caller's request id with its original JSON type (numeric ids were previously stringified).
-
-### 1.3.0-2
-
-- **Manual `/compact` now renders in T3's UI.** omp's manual `compact()` RPC handler emits no compaction events (it answers once when done), so T3 showed nothing and a benign "Nothing to compact (session too small)" failed the whole turn. The shim synthesizes `compaction_start` on the request and `compaction_end` (result or error) around omp's response.
-- **Spurious "Context compaction failed" cards eliminated.** omp's auto-compaction is a method cascade; attempts that end `skipped:true` (no result) are now dropped entirely instead of being forwarded as result-less failures.
-- **Stale-safe model catalog.** Successful discovery persists the catalog to `~/.cache/omp-t3/models.json`; on live-discovery failure the shim serves the last discovered list (`stale: true` + stderr notice) instead of a hardcoded guess. Empty catalogs count as discovery failures.
-- **Subagent card garbage fixed.** Child events are re-parented to the `task` call that spawned them (omp attributes late events to whichever tool is active, which split one child into several T3 nodes, some never terminating), children reported under the tool name are re-titled to their own id, and child state is pruned when the task call ends.
-
-### 1.3.0-1
-
-- Initial shim under the versioned scheme `<pi-major>.<pi-minor>.<pi-patch>-<iteration>` (package-derived, npm-legal encoding of a 4th iteration level).
-- Settlement mapping with `pendingMessageCount` enrichment, `abort_and_prompt` tracking, and the contract drift watchdog (`src/doctor.js`): last-known-good bookkeeping per cleanly settled turn, a settle watchdog that synthesizes `agent_settled` when omp withholds `session_settled`, and rate-limited GitHub issue reports with rollback guidance.
-- Model catalog pruning + slug normalization, with a fully asynchronous discovery pre-warm that never stalls the frame pipeline.
-- Subagent frame enrichment via `set_subagent_subscription` and compaction type renaming.
-- Session-directory symlink for T3 Code's historical usage dashboard.
-
----
-
-## License
-
-MIT
