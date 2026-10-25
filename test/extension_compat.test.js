@@ -5,6 +5,10 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+// These tests isolate skill-path adaptation. Policy enforcement is exercised
+// against an executable MCP fixture in subagent_policy.test.js.
+process.env.OMPT3_SUBAGENT_ALLOWED_MODELS = '';
+process.env.OMPT3_SUBAGENT_DISALLOWED_MODELS = '';
 const {
   adaptT3ExtensionArgs,
   GET_COMMANDS_MARKER,

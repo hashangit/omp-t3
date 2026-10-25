@@ -80,7 +80,8 @@ test('launcher falls back to original user arguments when every built-in is reje
   assert.match(result.stdout,/"type":"ready"/);
   const final=result.launches.at(-1);
   assert.equal(tools(final),undefined,'empty enforced list must never launch');
-  assert.ok(final.includes('--append-system-prompt=USER RULE'));
+  assert.ok(final.some(arg => arg.startsWith('--append-system-prompt=USER RULE\n\n') && arg.includes('Subagent model policy')));
+  assert.ok(final.includes('--extension'));
   assert.ok(!final.some(a=>a.includes('Delegation policy')));
   assert.match(result.stderr,/degraded/);
 });
@@ -90,7 +91,7 @@ for (const flags of [['--tools','read,missing'],['--tools=read,missing']]) {
   const result=await runLauncher(t,'single',[...flags,'--append-system-prompt','USER RULE']);
   assert.equal(result.launches.length,1,'user-selected tools must not be probed or pruned');
   assert.ok(flags.every(flag=>result.launches[0].includes(flag)));
-  assert.ok(result.launches[0].includes('USER RULE'));
+  assert.ok(result.launches[0].some(arg => arg.startsWith('USER RULE\n\n') && arg.includes('Subagent model policy')));
   assert.doesNotMatch(result.stderr,/degraded/);
  });
 }
@@ -137,4 +138,39 @@ test('interrupting the launcher during validation terminates only its probe',asy
  assert.equal(result.launches.length,1,'interrupted validation must not start a real session');
  assert.equal(result.pids.length,1);
  assert.throws(()=>process.kill(result.pids[0],0),{code:'ESRCH'},'the owned probe must be gone');
+});
+
+test('launcher refuses an incompatible T3 bridge instead of starting without the guard', async t => {
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ompt3-drift-'));
+ t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const extension=path.join(dir,'pi-t3-mcp-extension.ts');
+ fs.writeFileSync(extension,'export default function changedUpstream() {}');
+ const result=await runLauncher(t,'single',['--extension',extension]);
+ assert.match(result.stderr,/Launch refused: Cannot enforce subagent model policy/);
+ assert.doesNotMatch(result.stdout,/"type":"ready"/,'no unguarded final launch');
+ assert.equal(result.launches.length,2,'only the rejected and ready validation probes may start');
+});
+
+test('launcher refuses malformed model lists before starting OMP', async t => {
+ const result=await runLauncher(t,'single',[],{OMPT3_SUBAGENT_ALLOWED_MODELS:'glm-5.3-flash,'});
+ assert.equal(result.launches.length,0);
+ assert.match(result.stderr,/Launch refused: OMPT3_SUBAGENT_ALLOWED_MODELS/);
+});
+
+test('launcher refuses an unwritable policy cache before starting OMP', async t => {
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ompt3-cache-failure-'));
+ t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const blocker=path.join(dir,'file');
+ fs.writeFileSync(blocker,'block directory creation');
+ const result=await runLauncher(t,'single',[],{XDG_CACHE_HOME:blocker});
+ assert.equal(result.launches.length,0);
+ assert.match(result.stderr,/Launch refused:/);
+});
+
+test('clearing both lists and routing opt-out restores stock launch behavior', async t => {
+ const result=await runLauncher(t,'single',['--append-system-prompt','USER RULE'],{
+   OMPT3_DELEGATE_TASKS:'0',OMPT3_SUBAGENT_ALLOWED_MODELS:'',OMPT3_SUBAGENT_DISALLOWED_MODELS:''
+ });
+ assert.equal(result.launches.length,1);
+ assert.deepEqual(result.launches[0],['--mode','rpc-ui','--append-system-prompt','USER RULE']);
 });

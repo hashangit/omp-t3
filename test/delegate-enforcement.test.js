@@ -22,11 +22,15 @@ test('enforcement: default launch injects the task-free tools list and the polic
   assert.ok(ompArgs[policyIdx + 1].includes('delegate_task'), 'policy routes to delegate_task');
 });
 
-test('enforcement: byte-parity restored when OMPT3_DELEGATE_TASKS=0', () => {
+test('enforcement: routing opt-out keeps model restrictions active', () => {
   process.env.OMPT3_DELEGATE_TASKS = '0';
   try {
     const { ompArgs } = parseArgs(['--mode', 'rpc', '--session', 'abc']);
-    assert.deepEqual(ompArgs, ['--mode', 'rpc-ui', '--session', 'abc']);
+    assert.deepEqual(ompArgs.slice(0, 4), ['--mode', 'rpc-ui', '--session', 'abc']);
+    assert.ok(ompArgs.some(arg => arg.includes('Subagent model policy')));
+    assert.ok(!ompArgs.some(arg => arg.includes('Delegation policy')));
+    assert.ok(ompArgs.includes('--extension'));
+    assert.ok(!ompArgs.includes('--tools'));
   } finally {
     delete process.env.OMPT3_DELEGATE_TASKS;
   }
@@ -78,12 +82,13 @@ test('enforcement: composes with the concurrency cap and mode rewrite', () => {
 });
 
 
-test('enforcement: opt-out preserves user appendices in both forms', () => {
+test('enforcement: routing opt-out preserves user appendices and adds model policy in both forms', () => {
   process.env.OMPT3_DELEGATE_TASKS = '0';
   try {
     for (const flags of [['--append-system-prompt','USER RULE'],['--append-system-prompt=USER RULE']]) {
       const {ompArgs, delegation}=parseArgs(['--mode','rpc',...flags]);
-      assert.deepEqual(ompArgs,['--mode','rpc-ui',...flags]);
+      assert.ok(ompArgs.some(arg => arg.includes('USER RULE') && arg.includes('Subagent model policy')));
+      assert.ok(!ompArgs.some(arg => arg.includes('Delegation policy')));
       assert.equal(delegation.injectedTools,false);
     }
   } finally { delete process.env.OMPT3_DELEGATE_TASKS; }
@@ -95,7 +100,10 @@ test('enforcement: fallback keeps user prompt, session flags and cap overlay', (
     const {ompArgs,delegation}=parseArgs(['--mode','rpc','--session','session.jsonl','--append-system-prompt','USER RULE']);
     assert.equal(delegation.injectedTools,true);
     assert.ok(ompArgs.some(a=>a.includes('Delegation policy')));
-    assert.deepEqual(delegation.fallbackArgs.slice(0,6),['--mode','rpc-ui','--session','session.jsonl','--append-system-prompt','USER RULE']);
+    assert.deepEqual(delegation.fallbackArgs.slice(0,5),['--mode','rpc-ui','--session','session.jsonl','--append-system-prompt']);
+    assert.ok(delegation.fallbackArgs[5].startsWith('USER RULE\n\n'));
+    assert.ok(delegation.fallbackArgs[5].includes('Subagent model policy'));
+    assert.ok(!delegation.fallbackArgs[5].includes('Delegation policy'));
     assert.deepEqual(delegation.fallbackArgs.slice(-2),ompArgs.slice(-2));
     assert.equal(delegation.fallbackArgs.at(-2),'--config');
   } finally { delete process.env.OMPT3_MAX_SUBAGENTS; }

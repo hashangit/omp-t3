@@ -19,3 +19,8 @@ See `.agents/skills/gatekeeper/SKILL.md` for the router and its `references/setu
 ## Subagents
 
 For long-running delegated tasks, use T3's `delegate_task` MCP tool (target `providerInstanceId: "pi"`) instead of the native `task` tool so child sessions are created as openable T3 threads.
+
+### Model Restrictions for Subagents
+
+- **Disallowed Models**: **GPT Sol**, **Opus**, or **GLM 5.3** are **strictly not allowed** to be used for subagents.
+- **Allowed Models**: Only **GLM 5.3 Flash**, **Gemini 3.8 Flash**, and **DeepSeek V4.1 Flash** are allowed to be used for subagents.

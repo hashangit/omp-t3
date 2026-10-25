@@ -8,8 +8,15 @@ const { adaptT3ExtensionArgs, readDeferralLedger } = require('../src/extension_c
 const { setupSessionSymlink } = require('../src/symlink.js');
 const { ModelCatalogManager } = require('../src/model_catalog.js');
 const pkg = require('../package.json');
+const { createSubagentPolicy } = require('../src/subagent_policy.js');
 
-const parsed = parseArgs(process.argv.slice(2));
+let parsed;
+try {
+  parsed = parseArgs(process.argv.slice(2));
+} catch (err) {
+  console.error(`[omp-t3] Launch refused: ${err.message}`);
+  process.exit(1);
+}
 
 switch (parsed.action) {
   case 'version': {
@@ -54,8 +61,15 @@ Environment:
                            omp's task.maxConcurrency overlay (excess spawns
                            queue; the lead agent is told the limit). Unset or
                            invalid = no change to the launch.
+  OMPT3_SUBAGENT_ALLOWED_MODELS     Comma-separated model IDs or * patterns.
+                                    Defaults: glm-5.3-flash, gemini-3.8-flash,
+                                    deepseek-v4.1-flash.
+  OMPT3_SUBAGENT_DISALLOWED_MODELS  Deny rules win. Defaults: gpt-*sol*,
+                                    *opus*, glm-5.3, glm-5.3:*.
+  Empty values clear each list. Set BOTH lists empty to disable the model
+  policy. Otherwise target.model is required and native task is blocked.
 
-Explicit --tools lists override delegation enforcement and pass through unchanged.
+Explicit --tools lists override tool-list injection. Model restrictions remain active.
 Other flags (e.g. --session, --fork, --hide-thinking) are forwarded to omp.
 When --mode rpc is received from T3 Code, it is automatically rewritten to --mode rpc-ui.
 `);
@@ -166,6 +180,11 @@ When --mode rpc is received from T3 Code, it is automatically rewritten to --mod
           spawnAndProxy(finalArgs, extensionPath ? { t3ExtensionPath: extensionPath } : {});
         })
         .catch((err) => {
+          if (createSubagentPolicy().active) {
+            console.error(`[omp-t3] Launch refused: ${err.message}`);
+            process.exitCode = 1;
+            return;
+          }
           console.error(`[omp-t3] Extension adaptation failed (${err && err.message ? err.message : err}); launching without it.`);
           spawnAndProxy(args);
         });

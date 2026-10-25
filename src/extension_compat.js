@@ -21,17 +21,30 @@
  *
  * The copy lives under ~/.cache/omp-t3/ and is rewritten whenever the
  * transformed output differs (T3 refreshes its own cache file on updates).
- * If the upstream source drifts (marker not found exactly once), the original
- * file is passed through unchanged with a stderr warning: behavior then
- * matches stock OMP ($name crash) instead of silently running stale code.
+ * The copy also guards delegate_task at the MCP client boundary. With the
+ * model policy active, unreadable source, a changed MCP-client marker, or a
+ * cache-write failure refuses launch. Skill-path drift only warns. With both
+ * model lists cleared, adaptation failures retain the original passthrough.
  */
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
+const { createSubagentPolicy, policyRuntimeSource } = require('./subagent_policy.js');
 
 const T3_EXTENSION_BASENAME = 'pi-t3-mcp-extension.ts';
+const MCP_CLIENT_MARKER = 'const client = createMcpClient(endpoint, token);';
+const MCP_CLIENT_REPLACEMENT = [
+  policyRuntimeSource(),
+  MCP_CLIENT_MARKER,
+  'const ompt3CallTool = client.callTool.bind(client);',
+  'client.callTool = async (name, params, signal) => {',
+  '  const reason = ompt3SubagentPolicy.checkTool(name, params);',
+  '  if (reason) return { isError: true, content: [{ type: "text", text: reason }] };',
+  '  return ompt3CallTool(name, params, signal);',
+  '};'
+].join('\n');
 
 // Exact statement in T3's extension (verified against the T3 alpha cache,
 // 2026-10-17). Rewritten so every skill command OMP serves — including
@@ -48,7 +61,8 @@ const GET_COMMANDS_REPLACEMENT = [
 ].join('\n');
 
 function defaultCachePath() {
-  return path.join(os.homedir(), '.cache', 'omp-t3', 'pi-t3-mcp-extension.compat.ts');
+  const suffix = createSubagentPolicy().active ? '.policy' : '';
+  return path.join(os.homedir(), '.cache', 'omp-t3', `pi-t3-mcp-extension${suffix}.compat.ts`);
 }
 
 /** OMP's local agent state lives here (the shim runs children with ~/.omp/agent). */
@@ -149,6 +163,7 @@ function readDeferralLedger(options = {}) {
  *   nothing was adapted.
  */
 async function adaptT3ExtensionArgs(ompArgs, options = {}) {
+  const policy = options.policy || createSubagentPolicy();
   const cachePath = options.cachePath || defaultCachePath();
   const log = options.log || ((message) => console.error(`[omp-t3] ${message}`));
   const args = ompArgs.slice();
@@ -158,13 +173,13 @@ async function adaptT3ExtensionArgs(ompArgs, options = {}) {
     let value = null;
     let valueIndex = null;
     let tokenPrefix = '';
-    if (arg === '--extension' || arg === '-e') {
+    if (arg === '--extension' || arg === '-e' || arg === '--hook') {
       value = args[i + 1];
       valueIndex = i + 1;
-    } else if (arg.startsWith('--extension=')) {
-      value = arg.slice('--extension='.length);
+    } else if (arg.startsWith('--extension=') || arg.startsWith('--hook=')) {
+      tokenPrefix = arg.slice(0, arg.indexOf('=') + 1);
+      value = arg.slice(tokenPrefix.length);
       valueIndex = i;
-      tokenPrefix = '--extension=';
     }
     if (value === undefined || value === null || value === '') continue;
     if (path.basename(value) !== T3_EXTENSION_BASENAME) continue;
@@ -173,20 +188,31 @@ async function adaptT3ExtensionArgs(ompArgs, options = {}) {
     try {
       source = await fs.promises.readFile(value, 'utf8');
     } catch (err) {
+      if (policy.active) throw new Error(`Cannot enforce subagent model policy: cannot read T3 extension ${value}: ${err.message}`);
       log(`Cannot read T3 extension ${value}: ${err.message}. Passing it through unadapted.`);
       continue;
     }
 
+    let adapted = source;
+    if (policy.active) {
+      const clients = source.split(MCP_CLIENT_MARKER).length - 1;
+      if (clients !== 1) {
+        throw new Error(`Cannot enforce subagent model policy: T3 MCP client marker found ${clients} times in ${value}. Update omp-t3 for this T3 version; refusing an unguarded launch.`);
+      }
+      // A callback preserves literal $& in the embedded regex escaping code.
+      adapted = adapted.replace(MCP_CLIENT_MARKER, () => MCP_CLIENT_REPLACEMENT);
+    }
     const occurrences = source.split(GET_COMMANDS_MARKER).length - 1;
     if (occurrences !== 1) {
       log(
         `T3 extension ${value} no longer matches the known source (getCommands marker found ${occurrences} times). ` +
-        'Passing it through unadapted; $name skill inlining will fail until omp-t3 is updated.'
+        '$name skill inlining will fail until omp-t3 is updated.'
       );
-      continue;
+      if (!policy.active) continue;
+    } else {
+      adapted = adapted.replace(GET_COMMANDS_MARKER, GET_COMMANDS_REPLACEMENT);
     }
 
-    const adapted = source.replace(GET_COMMANDS_MARKER, GET_COMMANDS_REPLACEMENT);
     try {
       fs.mkdirSync(path.dirname(cachePath), { recursive: true });
       // Content-addressed rewrite: only touch the file when the output
@@ -197,8 +223,17 @@ async function adaptT3ExtensionArgs(ompArgs, options = {}) {
       } catch {
         // First run or cache cleared.
       }
-      if (existing !== adapted) fs.writeFileSync(cachePath, adapted);
+      if (existing !== adapted) {
+        const tmp = `${cachePath}.${process.pid}.${require('node:crypto').randomBytes(4).toString('hex')}.tmp`;
+        try {
+          fs.writeFileSync(tmp, adapted);
+          fs.renameSync(tmp, cachePath);
+        } finally {
+          fs.rmSync(tmp, { force: true });
+        }
+      }
     } catch (err) {
+      if (policy.active) throw new Error(`Cannot enforce subagent model policy: cannot write T3 extension ${cachePath}: ${err.message}`);
       log(`Cannot write adapted T3 extension copy ${cachePath}: ${err.message}. Passing the original through unadapted.`);
       continue;
     }
@@ -216,5 +251,7 @@ module.exports = {
   readDeferralLedger,
   T3_EXTENSION_BASENAME,
   GET_COMMANDS_MARKER,
-  GET_COMMANDS_REPLACEMENT
+  GET_COMMANDS_REPLACEMENT,
+  MCP_CLIENT_MARKER,
+  MCP_CLIENT_REPLACEMENT
 };
